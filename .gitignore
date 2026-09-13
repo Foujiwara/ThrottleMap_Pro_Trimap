@@ -1,0 +1,14 @@
+# Build outputs
+*.vescpkg
+# ...except the built release artifact, tracked deliberately so it can be
+# downloaded straight from the repo without a local VESC Tool build.
+!/carmap_beta.vescpkg
+ui.qml
+package_README-gen.md
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.test-runtime/

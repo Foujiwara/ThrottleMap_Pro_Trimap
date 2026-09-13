@@ -1,0 +1,1801 @@
+// Copyright 2026 CarMap Thermal Throttle contributors
+//
+// This file is part of the CarMap Thermal Throttle VESC package.
+// Licensed under the GNU General Public License v3 or later.
+//
+// {{PACKAGE_NAME}} v{{VERSION}}
+
+import QtQuick 2.15
+import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
+import QtQuick.Controls.Material 2.2
+import QtQuick.Window 2.2
+
+import Vedder.vesc.vescinterface 1.0
+import Vedder.vesc.commands 1.0
+import Vedder.vesc.configparams 1.0
+import Vedder.vesc.utility 1.0
+
+Item {
+    id: mainItem
+    // Refloat's mainItem does this too (confirmed by reading its actual
+    // source, vedderb/vesc_pkg/refloat/ui.qml.in) - it's the standard,
+    // correct way to have this root Item track its host container's
+    // real, live size. An earlier version of this file was missing it
+    // entirely and instead reached for mainItem.parent from deep inside
+    // child components as a workaround, which is what actually needed
+    // all the platform-specific size branching below - most of that
+    // complexity should no longer be necessary with this in place.
+    anchors.fill: parent
+    // Bumped on every edit - shown in the header as "build N" so a
+    // stale/cached install is obvious at a glance instead of ambiguous.
+    property int buildMarker: 1
+    // Desktop and phone hosts need genuinely different sizing rules, not
+    // one compromise value - a cap small enough to avoid overflowing a
+    // phone screen leaves desktop far too small, and anything generous
+    // enough for desktop overflows on a phone. Qt.platform.os is a
+    // standard Qt/QML global, independent of anything VESC Tool-specific.
+    readonly property bool isMobilePlatform: Qt.platform.os === "android" || Qt.platform.os === "ios"
+    property string tabTitle: "CarMap Beta"
+    property bool isHorizontal: width > height
+    property Commands vescCommands: VescIf.commands()
+
+    // ---------------------------------------------------------------
+    // Protocol constants (must mirror lisp/protocol.lisp)
+    readonly property int cmdSetCell:    0x01
+    readonly property int cmdSetMapRow:  0x02
+    readonly property int cmdSetConfig:  0x03
+    readonly property int cmdSetThr:     0x04
+    readonly property int cmdSave:       0x05
+    readonly property int cmdLoad:       0x06
+    readonly property int cmdReset:      0x07
+    readonly property int cmdReqMap:     0x08
+    readonly property int cmdReqCfg:     0x09
+    readonly property int cmdSetTestThr: 0x0A
+
+    readonly property int rxLive:    0x80
+    readonly property int rxMapRow:  0x81
+    readonly property int rxStatus: 0x82
+    readonly property int rxCfgEcho: 0x83
+
+    // Vertical axis spans -100%..+100% throttle - keep in sync with
+    // map.lisp. Rows 0..9 are the brake half (10% steps), row 10 is zero
+    // throttle, rows 10..30 are traction (5% steps). The duty axis is
+    // 10% steps: 21x21 would not fit the EEPROM once the brake half was
+    // added, and bilinear interpolation smooths duty anyway.
+    readonly property int mapThrN: 31
+    readonly property int mapDutyN: 11
+    readonly property int mapThrZero: 10
+    readonly property int mapCells: 341
+
+    // Signed throttle a row stands for, and its label.
+    function rowThrottle(t) {
+        return t < mapThrZero ? (t - mapThrZero) / 10.0 : (t - mapThrZero) / 20.0
+    }
+    function rowPct(t) { return Math.round(rowThrottle(t) * 100) }
+    function dutyPct(d) { return d * 10 }
+    // Fractional row position of a signed throttle - the inverse of
+    // rowThrottle, and the same two-slope axis map-lookup uses.
+    function rowPosOf(thr) {
+        thr = Math.max(-1, Math.min(1, thr))
+        return mapThrZero + thr * (thr < 0 ? 10 : 20)
+    }
+    // Lowest row on screen: the brake half is hidden while it is off.
+    function firstRow() { return cfgBrakeMap === 1 ? 0 : mapThrZero }
+    // Signed throttle actually in effect right now, for the live dot.
+    function liveSigned() { return liveBrake > 0 ? -liveBrake : liveThrottle }
+
+    // ---------------------------------------------------------------
+    // Map data model: flat JS array, row-major [thrIdx*mapDutyN + dutyIdx]
+    property var mapData: initMapData()
+    property var selection: ({ active:false, t0:0, d0:0, t1:0, d1:0 })
+    property int curRow: 20   // for row/col copy-paste + curve picker
+    property var clipboardRow: null
+    property var clipboardCol: null
+
+    // ---------------------------------------------------------------
+    // Live telemetry
+    property real liveThrottle: 0
+    property real liveDuty: 0
+    property real liveErpm: 0
+    property real liveCurRel: 0
+    property real liveCurA: 0
+    property real liveBrake: 0
+    property string statusText: "Not connected"
+    property string lastCmdStatus: "" // last SAVE/LOAD/RESET/REQUEST_* reply, see handleRx
+
+    // ---------------------------------------------------------------
+    // Configurator state
+    property int cfgPreset: 0 // 0 custom, 1 street, 2 race, 3 wet, 4 direct
+    property real cfgTorqueResp: 1.0
+    property real cfgSpeedCoupling: 1.0
+    property real cfgTransWidth: 0.10
+    property int cfgTransShape: 1
+    property real cfgHighHold: 0.6
+    property real cfgEngineBrake: 0.15
+    property real cfgOverrunRegen: 0.12
+    property int cfgRegenCurve: 1
+    // Brake half of the map: off keeps the plain proportional lever.
+    property int cfgBrakeMap: 0
+    // 0 regen only, 1 current no reverse, 2 current bidirectional
+    property int cfgBrakeType: 0
+    property int cfgRevErpm: 500
+
+    property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
+    property int thrInvert: 0
+    property real thrMin: 0.02
+    property real thrMax: 0.98
+    property real thrDeadband: 0.02
+    property real thrFilter: 1.0
+    property int thrBrakeMode: 0 // independent ADC2 brake channel
+
+
+    function validateImport(obj) {
+        if (!obj || !Array.isArray(obj.map) || obj.map.length !== mapCells) throw Error("Expected " + mapCells + " map cells")
+        function range(v, lo, hi, integer) {
+            if (typeof v !== "number" || !isFinite(v) || v < lo || v > hi || (integer && v !== Math.floor(v))) throw Error("Invalid value in import")
+        }
+        for (var i = 0; i < obj.map.length; i++) range(obj.map[i], -1, 1, false)
+        if (obj.cfg) {
+            var c = obj.cfg
+            range(c.preset,0,4,true); range(c.torqueResp,0.3,2,false); range(c.speedCoupling,0,1.5,false)
+            range(c.transWidth,0.02,0.3,false); range(c.transShape,0,3,true); range(c.highHold,0,1,false)
+            range(c.engineBrake,0,0.6,false); range(c.overrunRegen,0,0.5,false); range(c.regenCurve,0,3,true)
+            range(c.thrSource,0,3,true); range(c.thrInvert,0,1,true); range(c.thrMin,0,1,false); range(c.thrMax,0,1,false)
+            if (c.thrMin >= c.thrMax) throw Error("Min must be below Max")
+            range(c.thrDeadband,0,0.999,false); range(c.thrFilter,0.001,1,false)
+            if (c.thrBrakeMode !== undefined) range(c.thrBrakeMode,0,2,true)
+            if (c.brakeMap !== undefined) range(c.brakeMap,0,1,true)
+            if (c.brakeType !== undefined) range(c.brakeType,0,2,true)
+            if (c.revErpm !== undefined) range(c.revErpm,0,20000,true)
+        }
+    }
+
+    function initMapData() {
+        var a = []
+        for (var i = 0; i < mapCells; i++) a.push(0.0)
+        return a
+    }
+    // Shared by the typed-value fields next to the Configurator/throttle
+    // sliders below: accepts either "." or "," as the decimal separator,
+    // clamps into the slider's own range, and returns null (caller keeps
+    // the previous value) for anything that doesn't parse as a number.
+    function parseClamped(text, lo, hi) {
+        var v = parseFloat(String(text).replace(',', '.'))
+        if (isNaN(v)) return null
+        return Math.max(lo, Math.min(hi, v))
+    }
+    function quantizeCell(v) {
+        var x = Math.max(-1, Math.min(1, v)) * 100
+        return (x < 0 ? Math.ceil(x) : Math.floor(x)) / 100
+    }
+    function cellIdx(t, d) { return t * mapDutyN + d }
+    function getCell(t, d) { return mapData[cellIdx(t, d)] }
+    function setCellLocal(t, d, v) {
+        v = quantizeCell(v)
+        cfgPreset = 0
+        var arr = mapData.slice()
+        arr[cellIdx(t, d)] = v
+        mapData = arr
+    }
+
+    // ---------------------------------------------------------------
+    // Wire helpers (big-endian to match lispBM bufget/bufset defaults)
+    function fxEnc(v) { return Math.round(v * 1000) }
+    function fxDec(v) { return v / 1000.0 }
+
+    function transmitPacket(bytesArray) {
+        if (!VescIf.isPortConnected()) { statusText = "Not connected"; return }
+        var buf = new ArrayBuffer(bytesArray.length)
+        var view = new DataView(buf)
+        for (var i = 0; i < bytesArray.length; i++) view.setUint8(i, bytesArray[i] & 0xff)
+        vescCommands.sendCustomAppData(buf)
+    }
+    function i16Bytes(v) {
+        var iv = Math.max(-32768, Math.min(32767, Math.round(v)))
+        if (iv < 0) iv += 65536
+        return [ (iv >> 8) & 0xff, iv & 0xff ]
+    }
+
+    function sendSetCell(t, d, v) {
+        var b = [cmdSetCell, t & 0xff, d & 0xff].concat(i16Bytes(fxEnc(v)))
+        sendPacket(b)
+    }
+    function sendSetMapRow(t) {
+        var b = [cmdSetMapRow, t & 0xff]
+        for (var d = 0; d < mapDutyN; d++) b = b.concat(i16Bytes(fxEnc(getCell(t, d))))
+        sendPacket(b)
+    }
+    function sendAllRows() { for (var t = 0; t < mapThrN; t++) sendSetMapRow(t) }
+
+    function sendSetConfig(regenerate) {
+        var b = [cmdSetConfig, cfgPreset & 0xff]
+        b = b.concat(i16Bytes(fxEnc(cfgTorqueResp)))
+        b = b.concat(i16Bytes(fxEnc(cfgSpeedCoupling)))
+        b = b.concat(i16Bytes(fxEnc(cfgTransWidth)))
+        b.push(cfgTransShape & 0xff)
+        b = b.concat(i16Bytes(fxEnc(cfgHighHold)))
+        b = b.concat(i16Bytes(fxEnc(cfgEngineBrake)))
+        b = b.concat(i16Bytes(fxEnc(cfgOverrunRegen)))
+        b.push(cfgRegenCurve & 0xff)
+        b.push(regenerate === false ? 0 : 1)
+        b.push(cfgBrakeMap & 0xff)
+        b.push(cfgBrakeType & 0xff)
+        b = b.concat(i16Bytes(cfgRevErpm))
+        sendPacket(b)
+    }
+    function sendSetThrottle() {
+        benchValue = 0
+        var b = [cmdSetThr, thrSource & 0xff, thrInvert & 0xff]
+        b = b.concat(i16Bytes(fxEnc(thrMin)))
+        b = b.concat(i16Bytes(fxEnc(thrMax)))
+        b = b.concat(i16Bytes(fxEnc(thrDeadband)))
+        b = b.concat(i16Bytes(fxEnc(thrFilter)))
+        b.push(thrBrakeMode & 0xff)
+        sendPacket(b)
+    }
+    function sendSave() {
+        if (pendingPacket !== null || txQueue.length > 0) { lastCmdStatus = "Wait for the current transfer before saving"; return }
+        if (!mapReceived || !cfgReceived) { lastCmdStatus = "Read map and settings before saving"; return }
+        if (regenDebounce.running) { regenDebounce.stop(); regenerateLocalMap() }
+        lastCmdStatus = "Uploading and saving…"
+        sendSetConfig(false); sendSetThrottle(); sendAllRows(); sendPacket([cmdSave])
+    }
+    function sendLoad()  { sendPacket([cmdLoad]) }
+    function sendReset() { sendPacket([cmdReset]) }
+    function requestMap() { sendPacket([cmdReqMap]) }
+    function requestCfg() { sendPacket([cmdReqCfg]) }
+    function sendTestThrottle(v) {
+        benchValue = v
+        transmitPacket([cmdSetTestThr].concat(i16Bytes(fxEnc(v))))
+    }
+
+
+    property var txQueue: []
+    property var pendingPacket: null
+    property bool mapReceived: false
+    property bool cfgReceived: false
+    property var rowSeen: []
+    property double lastLiveTime: 0
+    property real benchValue: 0
+    onThrSourceChanged: benchValue = 0
+
+    // One acknowledged command at a time prevents overflowing the VESC mailbox.
+    function sendPacket(bytes) {
+        if (!VescIf.isPortConnected()) { lastCmdStatus = "Not connected"; return }
+        if (txQueue.length >= 64) { failTransfer("Too many pending commands"); return }
+        txQueue.push(bytes)
+        pumpTx()
+    }
+    function pumpTx() {
+        if (pendingPacket !== null || txQueue.length === 0) return
+        pendingPacket = txQueue.shift()
+        if (pendingPacket[0] === cmdReqMap) { rowSeen = []; mapReceived = false }
+        commandTimeout.restart()
+        transmitPacket(pendingPacket)
+    }
+    function failTransfer(message) {
+        commandTimeout.stop(); pendingPacket = null; txQueue = []
+        mapReceived = false; cfgReceived = false
+        lastCmdStatus = message
+    }
+    Timer { id: commandTimeout; interval: 20000; onTriggered: failTransfer("Command timed out; read back before retrying") }
+    Timer {
+        interval: 500; running: true; repeat: true
+        onTriggered: {
+            if (!VescIf.isPortConnected() || Date.now() - lastLiveTime > 2000) {
+                statusText = "Not connected"; benchValue = 0
+                if (pendingPacket !== null && !VescIf.isPortConnected()) failTransfer("Disconnected during transfer")
+                mapReceived = false; cfgReceived = false
+            }
+        }
+    }
+    Timer {
+        interval: 100; repeat: true
+        running: thrSource === 3 && benchValue !== 0 && VescIf.isPortConnected()
+        onTriggered: transmitPacket([cmdSetTestThr].concat(i16Bytes(fxEnc(benchValue))))
+    }
+
+    // ---------------------------------------------------------------
+    // Receive path
+    Connections {
+        target: vescCommands
+        function onCustomAppDataReceived(data) { handleRx(data) }
+    }
+
+    function handleRx(data) {
+        var view = new DataView(data)
+        if (view.byteLength < 1) return
+        var cmd = view.getUint8(0)
+        if (cmd === rxLive) {
+            if (view.byteLength !== 15) return
+            lastLiveTime = Date.now()
+            if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0) { requestMap(); requestCfg() }
+            liveThrottle = fxDec(view.getInt16(1, false))
+            liveDuty = fxDec(view.getInt16(3, false))
+            liveErpm = view.getInt32(5, false)
+            liveCurRel = fxDec(view.getInt16(9, false))
+            liveCurA = view.getInt16(11, false) / 100.0
+            liveBrake = fxDec(view.getInt16(13, false))
+            statusText = "Connected"
+        } else if (cmd === rxMapRow) {
+            if (view.byteLength !== 24) return
+            var row = view.getUint8(1)
+            if (row >= mapThrN) return
+            // A 31-bit mask would overflow a JS bitwise int, so count the
+            // rows in a plain array instead.
+            rowSeen[row] = true
+            var arr = mapData.slice()
+            for (var d = 0; d < mapDutyN; d++)
+                arr[cellIdx(row, d)] = fxDec(view.getInt16(2 + d * 2, false))
+            mapData = arr
+        } else if (cmd === rxStatus) {
+            // Separate from statusText on purpose: that one doubles as
+            // the connection indicator and gets overwritten back to
+            // "Connected" by the very next LIVE packet (20 Hz), so a
+            // command confirmation stored there would flash for at most
+            // ~50ms - effectively invisible. lastCmdStatus only changes
+            // on an actual STATUS reply.
+            if (view.byteLength < 3) return
+            var code = view.getUint8(1), ack = view.getUint8(2)
+            if (ack === cmdSetTestThr) return
+            if (pendingPacket === null || ack !== pendingPacket[0]) return
+            commandTimeout.stop()
+            if (code >= 4) {
+                failTransfer(({4:"Save failed: EEPROM readback differs", 5:"No valid saved data", 6:"Invalid command or settings", 7:"Controller command failed"})[code] || "Controller error")
+                return
+            }
+            if (ack === cmdReqMap) {
+                var got = 0
+                for (var r = 0; r < mapThrN; r++) if (rowSeen[r]) got++
+                mapReceived = got === mapThrN
+                if (!mapReceived) { failTransfer("Incomplete map received"); return }
+            }
+            if (code > 0) lastCmdStatus = ["OK", "Map and settings saved and verified", "Map loaded", "Reset to defaults"][code]
+            pendingPacket = null
+            pumpTx()
+        } else if (cmd === rxCfgEcho) {
+            if (view.byteLength !== 31) return
+            cfgReceived = true
+            cfgPreset = view.getUint8(1)
+            cfgTorqueResp = fxDec(view.getInt16(2, false))
+            cfgSpeedCoupling = fxDec(view.getInt16(4, false))
+            cfgTransWidth = fxDec(view.getInt16(6, false))
+            cfgTransShape = view.getUint8(8)
+            cfgHighHold = fxDec(view.getInt16(9, false))
+            cfgEngineBrake = fxDec(view.getInt16(11, false))
+            cfgOverrunRegen = fxDec(view.getInt16(13, false))
+            cfgRegenCurve = view.getUint8(15)
+            thrSource = view.getUint8(16)
+            thrInvert = view.getUint8(17)
+            thrMin = fxDec(view.getInt16(18, false))
+            thrMax = fxDec(view.getInt16(20, false))
+            thrDeadband = fxDec(view.getInt16(22, false))
+            thrFilter = fxDec(view.getInt16(24, false))
+            thrBrakeMode = view.getUint8(26)
+            cfgBrakeMap = view.getUint8(27)
+            cfgBrakeType = view.getUint8(28)
+            cfgRevErpm = view.getInt16(29, false)
+        }
+    }
+
+    Component.onCompleted: {
+        requestMap()
+        requestCfg()
+    }
+
+    // ---------------------------------------------------------------
+    // Preset / map-generation logic. Lives here (on mainItem, the file's
+    // root) rather than inside one tab's Component, because each
+    // Component {} block has its own separate id namespace - code and
+    // ids declared inside mapTabComponent aren't visible from
+    // configuratorTabComponent or vice versa. Functions/properties on
+    // mainItem ARE visible from every Component in this file (they're
+    // captured in each Component's lexical/creation scope), so both the
+    // Map tab and the Configurator tab can drive the exact same preset
+    // and map-generation controls from here.
+    property var presets: [
+        { name: "Custom",         id: 0 },
+        { name: "Thermal Street", id: 1 },
+        { name: "Thermal Race",   id: 2 },
+        { name: "Wet",            id: 3 },
+        { name: "Direct Electric",id: 4 }
+    ]
+
+    function applyPresetValues(id) {
+        if (id === 1) { // Thermal Street
+            cfgTorqueResp = 0.85; cfgSpeedCoupling = 1.0; cfgTransWidth = 0.10
+            cfgTransShape = 1; cfgHighHold = 0.55; cfgEngineBrake = 0.15
+            cfgOverrunRegen = 0.12; cfgRegenCurve = 1
+        } else if (id === 2) { // Thermal Race
+            cfgTorqueResp = 1.0; cfgSpeedCoupling = 0.9; cfgTransWidth = 0.06
+            cfgTransShape = 3; cfgHighHold = 0.9; cfgEngineBrake = 0.08
+            cfgOverrunRegen = 0.06; cfgRegenCurve = 2
+        } else if (id === 3) { // Wet
+            cfgTorqueResp = 0.6; cfgSpeedCoupling = 1.1; cfgTransWidth = 0.16
+            cfgTransShape = 1; cfgHighHold = 0.35; cfgEngineBrake = 0.10
+            cfgOverrunRegen = 0.05; cfgRegenCurve = 1
+        } else if (id === 4) { // Direct Electric
+            cfgTorqueResp = 1.0; cfgSpeedCoupling = 0.0; cfgTransWidth = 0.02
+            cfgTransShape = 0; cfgHighHold = 1.0; cfgEngineBrake = 0.02
+            cfgOverrunRegen = 0.0; cfgRegenCurve = 0
+        }
+        cfgPreset = id
+    }
+
+    // Local (QML-side) mirror of gen-thermal-map from map.lisp, used so
+    // the heatmap updates instantly without waiting on a round trip; the
+    // authoritative regeneration still happens on the VESC when
+    // SET_CONFIG is received with preset > 0.
+    function thermalPeak(thr, torqueResp, highHold) {
+        var base = Math.pow(thr, torqueResp)
+        var smooth = Math.max(0, Math.min(1, (thr - 0.6) / 0.4))
+        return base + (thr - base) * highHold * smooth
+    }
+    function shapeCurve(p, shape) {
+        if (shape === 0) return p
+        if (shape === 1) return p*p
+        if (shape === 2) return 1 - Math.pow(1-p, 3)
+        return Math.pow(p, 4)
+    }
+    // Dragging a slider fires onMoved many times per second; calling
+    // regenerateLocalMap() straight from onMoved recomputes all 441
+    // cells and forces the heatmap/curve/iso Canvases to fully redraw
+    // on every single tick of the drag, which is what was actually
+    // causing the reported lag - not the drawing itself (that part was
+    // already split into cheap/expensive layers earlier). Route slider
+    // handlers through requestRegen() instead: it only restarts a short
+    // timer, so the real recompute+redraw happens once, shortly after
+    // the user stops moving the slider, not on every pixel of the drag.
+    property Timer regenDebounce: Timer { interval: 60; onTriggered: regenerateLocalMap() }
+    function requestRegen() { regenDebounce.restart() }
+
+    // Traction half only: the brake rows are hand territory and no
+    // slider ever rewrites them (gen-thermal-map in map.lisp matches).
+    function regenerateLocalMap() {
+        var arr = mapData.slice()
+        for (var ti = 0; ti < 21; ti++) {
+            var thr = ti / 20.0
+            var peak = thermalPeak(thr, cfgTorqueResp, cfgHighHold)
+            var balanceDuty = Math.max(0, Math.min(1, thr * cfgSpeedCoupling))
+            for (var di = 0; di < mapDutyN; di++) {
+                var duty = di / (mapDutyN - 1)
+                var val
+                if (thr < 0.02) {
+                    val = -cfgEngineBrake * Math.pow(duty, 1 + cfgRegenCurve)
+                } else if (cfgSpeedCoupling === 0) {
+                    val = peak
+                } else {
+                    var start = Math.max(0, balanceDuty - cfgTransWidth)
+                    if (duty <= start) val = peak
+                    else if (duty <= balanceDuty) {
+                        var p = (duty - start) / Math.max(0.001, balanceDuty - start)
+                        val = peak * (1 - shapeCurve(p, cfgTransShape))
+                    } else {
+                        var over = (duty - balanceDuty) / Math.max(0.001, 1 - balanceDuty)
+                        val = -cfgOverrunRegen * Math.pow(Math.max(0,Math.min(1,over)), 1 + cfgRegenCurve)
+                    }
+                }
+                arr[cellIdx(ti + mapThrZero, di)] = quantizeCell(val)
+            }
+        }
+        mapData = arr
+    }
+
+    // ---------------------------------------------------------------
+    // Color scale: -1..0..+1 -> blue/purple .. gray .. green/yellow/orange/red
+    function valueColor(v) {
+        v = Math.max(-1, Math.min(1, v))
+        if (v >= 0) {
+            var stops = [
+                { p: 0.0,  c: Qt.rgba(0.42, 0.45, 0.50, 1) }, // neutral gray at 0
+                { p: 0.25, c: Qt.rgba(0.20, 0.70, 0.35, 1) }, // green
+                { p: 0.55, c: Qt.rgba(0.90, 0.80, 0.15, 1) }, // yellow
+                { p: 0.80, c: Qt.rgba(0.95, 0.55, 0.10, 1) }, // orange
+                { p: 1.0,  c: Qt.rgba(0.90, 0.15, 0.15, 1) }  // red
+            ]
+            return lerpStops(stops, v)
+        } else {
+            var stopsN = [
+                { p: 0.0,  c: Qt.rgba(0.42, 0.45, 0.50, 1) },
+                { p: 0.40, c: Qt.rgba(0.25, 0.45, 0.85, 1) }, // blue
+                { p: 1.0,  c: Qt.rgba(0.55, 0.20, 0.75, 1) }  // violet
+            ]
+            return lerpStops(stopsN, -v)
+        }
+    }
+    function lerpStops(stops, p) {
+        for (var i = 0; i < stops.length - 1; i++) {
+            if (p >= stops[i].p && p <= stops[i+1].p) {
+                var t = (p - stops[i].p) / (stops[i+1].p - stops[i].p || 1)
+                var a = stops[i].c, b = stops[i+1].c
+                return Qt.rgba(a.r + (b.r-a.r)*t, a.g + (b.g-a.g)*t, a.b + (b.b-a.b)*t, 1)
+            }
+        }
+        return stops[stops.length-1].c
+    }
+
+    // Pane (not a plain Rectangle) because it has a `font` property that
+    // cascades to every descendant Label/Button/ComboBox/etc that doesn't
+    // set its own font.pixelSize - a bare Item/Rectangle has no such
+    // property at all, and assigning font.* to one is a QML load error
+    // (this is why an earlier build failed to load entirely).
+    Pane {
+        // Capping width to Screen.width made mobile truncation WORSE
+        // (confirmed), meaning Screen.width is measured in a different
+        // unit/scale than mainItem.parent.width on that host (a DPI
+        // mismatch) rather than the two agreeing on "the real screen
+        // width" - reverted. Back to plain anchors.fill: parent, same as
+        // Refloat, until the debug readout below gives real numbers to
+        // work from instead of another guess.
+        anchors.fill: parent
+        // Kept as a safety net regardless: switching to a different VESC
+        // Tool tab on a phone once left a leftover render of this page's
+        // heatmap Canvas visibly floating over the other tab. Costs
+        // nothing when sizes are already correct.
+        clip: true
+        padding: 0
+        // Smaller on mobile: at 22px, the 4 TabButtons (Map/Curves/3D/
+        // Configurator) don't fit a phone-width TabBar, pushing
+        // Configurator out of reach entirely once content is clipped to
+        // our own bounds (see the Pane's clip: true below).
+        font.pixelSize: mainItem.isMobilePlatform ? 15 : 22
+        background: Rectangle { color: "#15181d" }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            RowLayout {
+                id: headerRow
+                Layout.fillWidth: true
+                // This row was never audited for the same overflow class
+                // as everything below it - a plain Label defaults its
+                // Layout.minimumWidth to its own full text, so 4-5 fixed
+                // labels side by side here (title + build + debug + dot +
+                // status) could force this row, and therefore the whole
+                // page above the tab bar, wider than a phone screen no
+                // matter what gets fixed further down. Every label here
+                // now either elides or is deliberately kept very short.
+                Label {
+                    text: "CarMap Thermal Throttle"
+                    font.pixelSize: 30; font.bold: true; color: "#e8e8e8"
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                }
+                // Bump buildMarker on every edit to this file so a stale/
+                // cached install is immediately obvious instead of
+                // ambiguous - "still the same" is either a real no-op fix
+                // or a cache; this number tells them apart at a glance.
+                Label { text: "b" + buildMarker; color: "#f80"; font.bold: true }
+                Label {
+                    font.pixelSize: 10; color: "#0f0"
+                    Layout.maximumWidth: 160
+                    elide: Text.ElideRight
+                    text: "w" + Math.round(mainItem.width) +
+                          "/p" + (mainItem.parent ? Math.round(mainItem.parent.width) : 0) +
+                          "/s" + Math.round(Screen.width)
+                }
+                Rectangle {
+                    width: 10; height: 10; radius: 5
+                    color: statusText === "Connected" ? "#33cc66" : "#888888"
+                }
+            }
+
+            TabBar {
+                id: tabBar
+                Layout.fillWidth: true
+                Material.background: "#1d2127"
+                TabButton { text: "Map" }
+                TabButton { text: "Curves" }
+                TabButton { text: "3D" }
+                TabButton { text: "Config" }
+            }
+
+            StackLayout {
+                id: stackLayout
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                currentIndex: tabBar.currentIndex
+
+                // Everything below is defined inline (not as separate QML
+                // component files): a VESC Package ships exactly one qml
+                // file (see pkgdesc.qml / the packager), so there is no
+                // supported way to `import` a second local .qml type the
+                // way lisp/*.lisp files can be imported. Splitting the UI
+                // into named `property Component` blocks inside this one
+                // file keeps things readable without fighting that
+                // constraint - see docs/architecture.md.
+                Loader { sourceComponent: mapTabComponent }
+                Loader { sourceComponent: curvesTabComponent }
+                Loader { sourceComponent: iso3DTabComponent }
+                Loader { sourceComponent: configuratorTabComponent }
+            }
+        }
+    }
+
+    // =================================================================
+    // Tab: Map (heatmap + live dot + manual cell/row/col editing)
+    // =================================================================
+    Component {
+        id: mapTabComponent
+        Item {
+            id: mapTab
+            // Deliberately NOT anchors.fill: parent - in this host, that
+            // resolved to the item's own pre-existing (minimal) size
+            // instead of the real panel size. Binding directly to the
+            // StackLayout's own geometry (proven correct: the TabBar
+            // above it fills the whole panel width) sidesteps whatever
+            // is off about the Loader/parent chain in between.
+            width: stackLayout.width
+            height: stackLayout.height
+            property int hoverT: -1
+            property int hoverD: -1
+
+            // Explicit x/y/width/height instead of ColumnLayout/anchors:
+            // this host has repeatedly shown surprising results with
+            // Layout-negotiated sizing (see git history), including the
+            // heatmap growing out of frame once real telemetry started
+            // updating it. Two fixed zones, computed directly from
+            // mapTab's own (now known-good) size, removes any chance of
+            // a Layout feedback loop.
+            property real heatmapH: Math.max(280, Math.round(mapTab.height * 0.55))
+            property real controlsY: heatmapH + 8
+            property real controlsH: Math.max(160, mapTab.height - controlsY - 4)
+
+            Rectangle {
+                id: heatmapBox
+                x: 0; y: 0
+                width: mapTab.width
+                height: mapTab.heatmapH
+                    color: "#0e1013"
+                    border.color: "#333"
+                    radius: 4
+
+                    // Two stacked canvases instead of one: redrawing the
+                    // full 21x21 grid (441 cells, each with a fillRect +
+                    // strokeRect + measured fillText) on every single LIVE
+                    // telemetry packet (~20 Hz, or every pixel of a
+                    // dragged bench-throttle slider) was the real cause of
+                    // the reported lag. The grid only actually changes
+                    // when mapData/selection changes (rare - editing,
+                    // preset regen); the live dot changes constantly but
+                    // is cheap on its own (clear + one small circle) once
+                    // it isn't dragging the whole grid down with it.
+                    Canvas {
+                        id: heatmap
+                        anchors.fill: parent
+                        anchors.margins: 24
+                        property int rowBase: firstRow()
+                        property int rowCount: mapThrN - rowBase
+                        property real cw: width / mapDutyN
+                        property real ch: height / rowCount
+
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.clearRect(0, 0, width, height)
+                            try {
+                                for (var t = rowBase; t < mapThrN; t++) {
+                                    for (var d = 0; d < mapDutyN; d++) {
+                                        var v = getCell(t, d)
+                                        var col = valueColor(v)
+                                        ctx.fillStyle = Qt.rgba(col.r, col.g, col.b, 1)
+                                        var y = height - (t - rowBase + 1) * ch
+                                        var x = d * cw
+                                        var selected = isSelected(t, d)
+                                        ctx.fillRect(x, y, cw - 1, ch - 1)
+                                        if (selected) {
+                                            ctx.strokeStyle = "#ffffff"
+                                            ctx.lineWidth = 2
+                                            ctx.strokeRect(x+1, y+1, cw - 3, ch - 3)
+                                        }
+                                        if (cw > 30) {
+                                            ctx.fillStyle = Math.abs(v) > 0.5 ? "#111" : "#eee"
+                                            ctx.font = Math.max(10, Math.min(15, cw * 0.32)) + "px sans-serif"
+                                            ctx.textAlign = "center"
+                                            ctx.fillText(v.toFixed(2), x + cw/2, y + ch/2 + 4)
+                                        }
+                                    }
+                                }
+                            } catch (e) {
+                                ctx.fillStyle = "#ff5555"
+                                ctx.font = "15px sans-serif"
+                                ctx.textAlign = "left"
+                                ctx.fillText("Draw error: " + e, 8, 20)
+                            }
+                        }
+
+                        Connections { target: mainItem; function onMapDataChanged() { heatmap.requestPaint() } }
+                        Connections { target: mainItem; function onSelectionChanged() { heatmap.requestPaint() } }
+                        onRowBaseChanged: requestPaint()
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                        Component.onCompleted: requestPaint()
+
+                        function cellFromPos(mx, my) {
+                            var d = Math.floor(mx / cw)
+                            var t = rowBase + Math.floor((height - my) / ch)
+                            d = Math.max(0, Math.min(mapDutyN-1, d))
+                            t = Math.max(rowBase, Math.min(mapThrN-1, t))
+                            return { t: t, d: d }
+                        }
+                    }
+
+                    // Cheap overlay, repainted on every LIVE packet: just
+                    // the moving dot, transparent everywhere else so the
+                    // grid Canvas underneath shows through.
+                    Canvas {
+                        id: heatmapDot
+                        anchors.fill: heatmap
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.clearRect(0, 0, width, height)
+                            var lx = Math.abs(liveDuty) * width
+                            // Centre of the band the live throttle sits in,
+                            // so the dot lines up with the cell it reads.
+                            var ly = height - (rowPosOf(liveSigned()) - heatmap.rowBase + 0.5) * heatmap.ch
+                            ctx.beginPath()
+                            ctx.arc(lx, ly, 6, 0, 2*Math.PI)
+                            ctx.fillStyle = "#00e5ff"
+                            ctx.fill()
+                            ctx.strokeStyle = "#003"
+                            ctx.stroke()
+                        }
+                        Connections { target: mainItem; function onLiveDutyChanged() { heatmapDot.requestPaint() } }
+                        Connections { target: mainItem; function onLiveThrottleChanged() { heatmapDot.requestPaint() } }
+                        Connections { target: mainItem; function onLiveBrakeChanged() { heatmapDot.requestPaint() } }
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                        Component.onCompleted: requestPaint()
+                    }
+
+                    MouseArea {
+                        anchors.fill: heatmap
+                        onPressed: (mouse) => {
+                            var c = heatmap.cellFromPos(mouse.x, mouse.y)
+                            selection = { active: true, t0: c.t, d0: c.d, t1: c.t, d1: c.d }
+                            hoverT = c.t; hoverD = c.d
+                        }
+                        onPositionChanged: (mouse) => {
+                            if (!selection.active) return
+                            var c = heatmap.cellFromPos(mouse.x, mouse.y)
+                            selection = { active: true, t0: selection.t0, d0: selection.d0, t1: c.t, d1: c.d }
+                        }
+                        onClicked: (mouse) => {
+                            var c = heatmap.cellFromPos(mouse.x, mouse.y)
+                            hoverT = c.t; hoverD = c.d
+                        }
+                    }
+
+                    // axis labels
+                    Label { text: cfgBrakeMap === 1 ? "Brake -100%" : "Throttle 0%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: "Duty 100%"; color: "#888"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: "Throttle +100%"; color: "#888"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
+                }
+
+                Flickable {
+                    id: mapControlsFlick
+                    x: 0; y: mapTab.controlsY
+                    width: mapTab.width
+                    height: mapTab.controlsH
+                    clip: true
+                    contentWidth: width
+                    contentHeight: mapControlsCol.implicitHeight + 16
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar {
+                        policy: ScrollBar.AlwaysOn
+                        width: 14
+                    }
+                    ColumnLayout {
+                        id: mapControlsCol
+                        width: mapControlsFlick.width - 20
+                        spacing: 6
+
+                    Label { text: "Live"; font.bold: true; color: "#ddd" }
+                    GridLayout {
+                        columns: 2
+                        Label { text: "Throttle" ; color: "#aaa"}
+                        Label { text: (liveThrottle*100).toFixed(1) + " %"; color: "#fff" }
+                        Label { text: "Duty"; color: "#aaa" }
+                        Label { text: (liveDuty*100).toFixed(1) + " %"; color: "#fff" }
+                        Label { text: "ERPM"; color: "#aaa" }
+                        Label { text: liveErpm.toFixed(0); color: "#fff" }
+                        Label { text: "Current Rel"; color: "#aaa" }
+                        Label { text: liveCurRel.toFixed(2); color: "#fff" }
+                        Label { text: "Motor A"; color: "#aaa" }
+                        Label { text: liveCurA.toFixed(1) + " A"; color: "#fff" }
+                        Label { visible: thrBrakeMode !== 0; text: "Brake"; color: "#aaa" }
+                        Label { visible: thrBrakeMode !== 0; text: (liveBrake*100).toFixed(1) + " %"; color: "#fff" }
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    // Moved here from the Configurator tab: preset + the 8
+                    // map-shaping sliders, right next to the heatmap so
+                    // dragging them shows their effect immediately.
+                    Label { text: "Preset & map shape"; font.bold: true; color: "#ddd" }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        ComboBox {
+                            id: presetComboMap
+                            width: 180
+                            model: presets.map(function(p){ return p.name })
+                            currentIndex: cfgPreset
+                            onActivated: (idx) => {
+                                applyPresetValues(presets[idx].id)
+                                regenerateLocalMap()
+                                sendSetConfig(); requestMap()
+                            }
+                        }
+                        Button {
+                            text: "Regenerate map"
+                            onClicked: { regenDebounce.stop(); regenerateLocalMap(); sendSetConfig(); requestMap() }
+                        }
+                    }
+                    // Stacked (label+value row, slider below), not a
+                    // rigid 3-column grid: a GridLayout's columns each
+                    // need enough room for their widest cell at once and
+                    // refuse to shrink past that - confirmed on real
+                    // hardware as the actual cause of content shifting
+                    // out of frame below a certain window/screen width,
+                    // on desktop as much as on mobile. A slider alone on
+                    // its own full-width row has no such minimum.
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Torque response"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgTorqueResp.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.3, 2.0)
+                                        if (v !== null) { cfgTorqueResp = v; cfgPreset = 0; requestRegen() }
+                                        text = Qt.binding(function() { return cfgTorqueResp.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.3; to: 2.0; value: cfgTorqueResp; onMoved: { cfgTorqueResp = value; cfgPreset = 0; requestRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Speed coupling"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgSpeedCoupling.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.5)
+                                        if (v !== null) { cfgSpeedCoupling = v; cfgPreset = 0; requestRegen() }
+                                        text = Qt.binding(function() { return cfgSpeedCoupling.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.5; value: cfgSpeedCoupling; onMoved: { cfgSpeedCoupling = value; cfgPreset = 0; requestRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Transition width"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    // Shown/typed as a percentage (2-30%), matching the label.
+                                    text: (cfgTransWidth*100).toFixed(0) + " %"
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 2, 30)
+                                        if (v !== null) { cfgTransWidth = v/100.0; cfgPreset = 0; requestRegen() }
+                                        text = Qt.binding(function() { return (cfgTransWidth*100).toFixed(0) + " %" })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.02; to: 0.30; value: cfgTransWidth; onMoved: { cfgTransWidth = value; cfgPreset = 0; requestRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Transition shape"; color: "#ccc" }
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: ["Linear", "Progressive", "Exponential", "Late/abrupt"]
+                                currentIndex: cfgTransShape
+                                onActivated: (idx) => { cfgTransShape = idx; cfgPreset = 0; regenerateLocalMap() }
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "High throttle hold"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgHighHold.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.0)
+                                        if (v !== null) { cfgHighHold = v; cfgPreset = 0; requestRegen() }
+                                        text = Qt.binding(function() { return cfgHighHold.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgHighHold; onMoved: { cfgHighHold = value; cfgPreset = 0; requestRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Engine braking"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgEngineBrake.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 0.6)
+                                        if (v !== null) { cfgEngineBrake = v; cfgPreset = 0; requestRegen() }
+                                        text = Qt.binding(function() { return cfgEngineBrake.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 0.6; value: cfgEngineBrake; onMoved: { cfgEngineBrake = value; cfgPreset = 0; requestRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Overrun regen"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgOverrunRegen.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 0.5)
+                                        if (v !== null) { cfgOverrunRegen = v; cfgPreset = 0; requestRegen() }
+                                        text = Qt.binding(function() { return cfgOverrunRegen.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 0.5; value: cfgOverrunRegen; onMoved: { cfgOverrunRegen = value; cfgPreset = 0; requestRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Regen curve"; color: "#ccc" }
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: ["Linear", "Progressive", "Late"]
+                                currentIndex: cfgRegenCurve
+                                onActivated: (idx) => { cfgRegenCurve = idx; cfgPreset = 0; regenerateLocalMap() }
+                            }
+                        }
+                    }
+                    Button {
+                        text: "Send to VESC (generate authoritative map)"
+                        onClicked: { regenDebounce.stop(); regenerateLocalMap(); sendSetConfig(); requestMap() }
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    // Bench throttle here too (as well as on the
+                    // Configurator tab, where the source itself is
+                    // picked) so you can drag it while watching the live
+                    // dot move across the map you just shaped above.
+                    ColumnLayout {
+                        visible: thrSource === 3
+                        Layout.fillWidth: true
+                        Label { text: "Bench throttle (test source)"; font.bold: true; color: "#ddd" }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Slider {
+                                id: benchThrottleMap
+                                Layout.fillWidth: true
+                                from: cfgBrakeMap === 1 ? -1 : 0; to: 1
+                                value: mainItem.benchValue
+                                onMoved: sendTestThrottle(value)
+                                onPressedChanged: if (!pressed) sendTestThrottle(value)
+                            }
+                            Label { text: (benchThrottleMap.value*100).toFixed(0) + " %"; color: "#fff" }
+                            Button {
+                                text: "STOP"
+                                Material.background: "#b23b3b"
+                                onClicked: { benchThrottleMap.value = 0; sendTestThrottle(0) }
+                            }
+                        }
+                    }
+                    Label {
+                        visible: thrSource !== 3
+                        text: "Throttle source is not set to Test - pick it on the Configurator tab to bench-drive the map from here without ADC/PPM/UART hardware."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    Label { text: "Selected cell"; font.bold: true; color: "#ddd" }
+                    Label {
+                        color: "#fff"
+                        text: hoverT >= 0
+                            ? (hoverT < mapThrZero ? "Brake " : "Thr ") + Math.abs(rowPct(hoverT)) + "%  Duty "
+                              + dutyPct(hoverD) + "%\nValue " + getCell(hoverT, hoverD).toFixed(2)
+                            : "Click a cell to edit"
+                    }
+                    RowLayout {
+                        SpinBox {
+                            id: editSpin
+                            from: -100; to: 100; stepSize: 1
+                            editable: true
+                            // Qt's own SpinBox docs recommend this exact
+                            // validator for a negative `from` - the default
+                            // one is unreliable about accepting a leading
+                            // "-" while typing a negative value.
+                            validator: IntValidator { bottom: Math.min(editSpin.from, editSpin.to); top: Math.max(editSpin.from, editSpin.to) }
+                            value: hoverT >= 0 ? Math.round(getCell(hoverT, hoverD)*100) : 0
+                            onValueModified: {
+                                if (hoverT >= 0) {
+                                    setCellLocal(hoverT, hoverD, value/100.0)
+                                    sendSetCell(hoverT, hoverD, value/100.0)
+                                }
+                                // Typing (or +/-, or the indicators) writes
+                                // `value` imperatively, which replaces the
+                                // declarative binding above with a plain
+                                // static value - Qt.binding() re-establishes
+                                // it, the documented fix for an editable
+                                // control whose value should keep tracking
+                                // external state after the user edits it.
+                                // Without this, clicking a different map
+                                // cell afterwards would keep showing this
+                                // cell's value instead of the new one's.
+                                value = Qt.binding(function() {
+                                    return hoverT >= 0 ? Math.round(getCell(hoverT, hoverD)*100) : 0
+                                })
+                            }
+                        }
+                        Label { text: "%"; color: "#aaa" }
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    Label { text: "Row/Col tools"; font.bold: true; color: "#ddd" }
+                    RowLayout {
+                        Label { text: "Row"; color: "#aaa" }
+                        SpinBox { id: rowSpin; from: 0; to: mapThrN-1; editable: true; value: curRow; onValueModified: curRow = value }
+                        Label { text: rowPct(curRow) + " % throttle"; color: "#aaa" }
+                    }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 4
+                        Button { text: "+5%"; onClicked: bumpRow(curRow, 0.05) }
+                        Button { text: "-5%"; onClicked: bumpRow(curRow, -0.05) }
+                        Button { text: "Smooth"; onClicked: smoothRow(curRow) }
+                        Button { text: "Copy row"; onClicked: clipboardRow = mapRowSlice(curRow) }
+                        Button { text: "Paste row"; enabled: clipboardRow !== null; onClicked: pasteRow(curRow) }
+                    }
+                    RowLayout {
+                        Label { text: "Col (duty)"; color: "#aaa" }
+                        SpinBox { id: colSpin; from: 0; to: mapDutyN-1; editable: true; value: 5 }
+                        Label { text: dutyPct(colSpin.value) + " % duty"; color: "#aaa" }
+                    }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 4
+                        Button { text: "Copy col"; onClicked: clipboardCol = mapColSlice(colSpin.value) }
+                        Button { text: "Paste col"; enabled: clipboardCol !== null; onClicked: pasteCol(colSpin.value) }
+                        Button { text: "Interp. selection"; enabled: selection.active; onClicked: interpolateSelection() }
+                    }
+
+                    Label { text: "Drag on the map to multi-select cells."; wrapMode: Text.WordWrap; color: "#777"; font.pixelSize: 16 }
+                    }
+                }
+
+            function isSelected(t, d) {
+                if (!selection.active) return false
+                var tmin = Math.min(selection.t0, selection.t1), tmax = Math.max(selection.t0, selection.t1)
+                var dmin = Math.min(selection.d0, selection.d1), dmax = Math.max(selection.d0, selection.d1)
+                return t >= tmin && t <= tmax && d >= dmin && d <= dmax
+            }
+            function mapRowSlice(t) { var r = []; for (var d = 0; d < mapDutyN; d++) r.push(getCell(t,d)); return r }
+            function mapColSlice(d) { var r = []; for (var t = 0; t < mapThrN; t++) r.push(getCell(t,d)); return r }
+            // These used to call setCellLocal per cell, each doing its own
+            // full 441-element array copy + mapData reassignment (so a
+            // 441-cell selection did up to ~194,000 element copies, and
+            // every button click here forced multiple full canvas
+            // redraws instead of one). Batch the mutation into a single
+            // array copy and assign mapData exactly once instead.
+            function bumpRow(t, delta) {
+                cfgPreset = 0
+                var arr = mapData.slice()
+                for (var d = 0; d < mapDutyN; d++) {
+                    var v = Math.max(-1, Math.min(1, getCell(t,d) + delta))
+                    arr[cellIdx(t, d)] = v
+                }
+                mapData = arr
+                sendSetMapRow(t)
+            }
+            function smoothRow(t) {
+                cfgPreset = 0
+                var row = mapRowSlice(t)
+                var out = row.slice()
+                for (var d = 1; d < mapDutyN-1; d++) out[d] = (row[d-1] + row[d]*2 + row[d+1]) / 4
+                var arr = mapData.slice()
+                for (var d2 = 0; d2 < mapDutyN; d2++) arr[cellIdx(t, d2)] = Math.max(-1, Math.min(1, out[d2]))
+                mapData = arr
+                sendSetMapRow(t)
+            }
+            function pasteRow(t) {
+                cfgPreset = 0
+                if (!clipboardRow) return
+                var arr = mapData.slice()
+                for (var d = 0; d < mapDutyN; d++) arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardRow[d]))
+                mapData = arr
+                sendSetMapRow(t)
+            }
+            function pasteCol(d) {
+                cfgPreset = 0
+                if (!clipboardCol) return
+                var arr = mapData.slice()
+                for (var t = 0; t < mapThrN; t++) arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardCol[t]))
+                mapData = arr
+                for (var t2 = 0; t2 < mapThrN; t2++) sendSetMapRow(t2)
+            }
+            function interpolateSelection() {
+                cfgPreset = 0
+                if (!selection.active) return
+                var tmin = Math.min(selection.t0, selection.t1), tmax = Math.max(selection.t0, selection.t1)
+                var dmin = Math.min(selection.d0, selection.d1), dmax = Math.max(selection.d0, selection.d1)
+                var v0 = getCell(tmin, dmin), v1 = getCell(tmax, dmax)
+                var arr = mapData.slice()
+                var rows = {}
+                for (var t = tmin; t <= tmax; t++) {
+                    var ft = tmax > tmin ? (t - tmin) / (tmax - tmin) : 0
+                    for (var d = dmin; d <= dmax; d++) {
+                        var fd = dmax > dmin ? (d - dmin) / (dmax - dmin) : 0
+                        var f = (ft + fd) / (tmax > tmin || dmax > dmin ? (tmax>tmin && dmax>dmin ? 2 : 1) : 1)
+                        arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, v0 + (v1 - v0) * f))
+                    }
+                    rows[t] = true
+                }
+                mapData = arr
+                for (var key in rows) sendSetMapRow(parseInt(key))
+            }
+        }
+    }
+
+    // =================================================================
+    // Tab: Curves (2D cross-sections of the map, current-rel vs duty)
+    // =================================================================
+    Component {
+        id: curvesTabComponent
+        Item {
+            id: curvesTab
+            width: stackLayout.width
+            height: stackLayout.height
+            property var shownRows: ({10: true, 15: true, 20: true, 25: true, 30: true})
+            property int pickedRow: 20
+
+            // Explicit positioning, same reasoning as mapTabComponent -
+            // see the comment there.
+            property real curveH: Math.max(280, Math.round(curvesTab.height * 0.55))
+            property real controlsY: curveH + 8
+            property real controlsH: Math.max(140, curvesTab.height - controlsY - 4)
+
+            Rectangle {
+                id: curveBox
+                x: 0; y: 0
+                width: curvesTab.width
+                height: curvesTab.curveH
+                color: "#0e1013"; border.color: "#333"; radius: 4
+                    Canvas {
+                        id: curveCanvas
+                        anchors.fill: parent
+                        anchors.margins: 24
+                        function rowColor(rowIdx) {
+                            var f = rowIdx / (mapThrN - 1)
+                            return Qt.rgba(0.3 + 0.6*f, 0.8 - 0.5*f, 0.9 - 0.7*f, 1)
+                        }
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.clearRect(0, 0, width, height)
+                            try {
+                                ctx.strokeStyle = "#444"; ctx.lineWidth = 1
+                                var zeroY = height/2
+                                ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(width, zeroY); ctx.stroke()
+                                ctx.strokeStyle = "#333"
+                                ctx.strokeRect(0, 0, width, height)
+
+                                function plotRow(t, color, widthPx) {
+                                    ctx.strokeStyle = color; ctx.lineWidth = widthPx
+                                    ctx.beginPath()
+                                    for (var d = 0; d < mapDutyN; d++) {
+                                        var x = d / (mapDutyN-1) * width
+                                        var v = getCell(t, d)
+                                        var y = height/2 - v * (height/2)
+                                        if (d === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
+                                    }
+                                    ctx.stroke()
+                                }
+
+                                for (var t = firstRow(); t < mapThrN; t++) {
+                                    if (shownRows[t]) plotRow(t, curveCanvas.rowColor(t), 2)
+                                }
+                                plotRow(pickedRow, "#ffffff", 2)
+                            } catch (e) {
+                                ctx.fillStyle = "#ff5555"
+                                ctx.font = "15px sans-serif"
+                                ctx.textAlign = "left"
+                                ctx.fillText("Draw error: " + e, 8, 20)
+                            }
+                        }
+                        Connections { target: mainItem; function onMapDataChanged() { curveCanvas.requestPaint() } }
+                        Connections { target: curvesTab; function onShownRowsChanged() { curveCanvas.requestPaint() } }
+                        Connections { target: curvesTab; function onPickedRowChanged() { curveCanvas.requestPaint() } }
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                        Component.onCompleted: requestPaint()
+                    }
+
+                    // Cheap overlay for just the live point - see the
+                    // same split on the Map tab's heatmap for why.
+                    Canvas {
+                        id: curveDot
+                        anchors.fill: curveCanvas
+                        visible: showLiveCurve.checked
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.clearRect(0, 0, width, height)
+                            var lx2 = Math.abs(liveDuty) * width
+                            var ly = height/2 - liveCurRel * (height/2)
+                            ctx.beginPath(); ctx.arc(lx2, ly, 5, 0, 2*Math.PI)
+                            ctx.fillStyle = "#00e5ff"; ctx.fill()
+                        }
+                        Connections { target: mainItem; function onLiveDutyChanged() { curveDot.requestPaint() } }
+                        Connections { target: mainItem; function onLiveCurRelChanged() { curveDot.requestPaint() } }
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                        Component.onCompleted: requestPaint()
+                    }
+                    Label { text: "-1.0"; color: "#777"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: "+1.0"; color: "#777"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
+                    Label { text: "Duty 0% → 100%"; color: "#777"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                }
+
+                Flickable {
+                    id: curvesControlsFlick
+                    x: 0; y: curvesTab.controlsY
+                    width: curvesTab.width
+                    height: curvesTab.controlsH
+                    clip: true
+                    contentWidth: width
+                    contentHeight: curvesControlsCol.implicitHeight + 16
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn; width: 14 }
+                    ColumnLayout {
+                    id: curvesControlsCol
+                    width: curvesControlsFlick.width - 20
+                    Label { text: "Throttle rows shown"; font.bold: true; color: "#ddd" }
+                    Repeater {
+                        model: cfgBrakeMap === 1 ? [0, 5, 10, 15, 20, 25, 30] : [10, 15, 20, 25, 30]
+                        CheckBox {
+                            text: rowPct(modelData) + " %"
+                            checked: !!shownRows[modelData]
+                            onToggled: {
+                                var m = Object.assign({}, shownRows)
+                                m[modelData] = checked
+                                shownRows = m
+                            }
+                        }
+                    }
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+                    Label { text: "Pick any row"; font.bold: true; color: "#ddd" }
+                    Slider { Layout.fillWidth: true; from: firstRow(); to: mapThrN-1; stepSize: 1; value: pickedRow; onMoved: pickedRow = value }
+                    Label { text: rowPct(pickedRow) + " % throttle"; color: "#aaa" }
+                    CheckBox { id: showLiveCurve; text: "Show live point"; checked: true }
+                    }
+                }
+        }
+    }
+
+    // =================================================================
+    // Tab: pseudo-3D isometric view (no Qt3D dependency, see docs)
+    // =================================================================
+    Component {
+        id: iso3DTabComponent
+        Item {
+            id: iso3DTab
+            width: stackLayout.width
+            height: stackLayout.height
+            // Adjustable "camera": rotDeg spins the grid around its
+            // vertical axis, tiltFactor flattens/steepens the depth axis
+            // (low = more top-down, high = more side-on). This is a 2D
+            // affine transform, not a real 3D camera, but it's enough to
+            // make the isometric view feel rotatable/tiltable without
+            // pulling in a 3D engine - see docs/architecture.md for why
+            // no Qt3D/QtQuick3D dependency was taken on.
+            property real rotDeg: 45
+            property real tiltFactor: 0.8
+
+            property real controlsH: 64
+            property real canvasH: Math.max(240, iso3DTab.height - controlsH - 8)
+
+            Rectangle {
+                x: 0; y: 0
+                width: iso3DTab.width
+                height: iso3DTab.canvasH
+                color: "#0e1013"; border.color: "#333"; radius: 4
+
+                Canvas {
+                    id: isoCanvas
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    // Scaled to the canvas' real size, not fixed pixel
+                    // constants - a 21x21 grid drawn at a few px/tile was
+                    // an all-but-invisible speck in any normal-sized
+                    // canvas, which is why this tab looked "empty" before
+                    // the sizing chain was fixed.
+                    property int rowBase: firstRow()
+                    property real tileW: Math.max(4, 0.5 * width / (mapDutyN - 1))
+                    // Depth axis is scaled separately now that it has up
+                    // to 31 rows against the duty axis' 11.
+                    property real tileH: Math.max(3, 0.5 * height / (mapThrN - 1))
+                    property real zScale: Math.max(20, height * 0.25)
+
+                    function project(t, d, v) {
+                        var rad = iso3DTab.rotDeg * Math.PI / 180
+                        var ct = (rowBase + mapThrN - 1) / 2
+                        var cd = (mapDutyN - 1) / 2
+                        var rt = t - ct, rd = d - cd
+                        var cosr = Math.cos(rad), sinr = Math.sin(rad)
+                        var pt = rt * cosr - rd * sinr
+                        var pd = rt * sinr + rd * cosr
+                        var ox = width/2
+                        var oy = height * 0.55
+                        var x = ox + pd * tileW
+                        var y = oy - pt * tileH * iso3DTab.tiltFactor - v * zScale
+                        return { x: x, y: y }
+                    }
+
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        try {
+                            // painter's algorithm: back-to-front by (t+d),
+                            // a decent approximation regardless of rotDeg
+                            for (var s = 0; s <= (mapThrN-1) + (mapDutyN-1); s++) {
+                                for (var t = rowBase; t < mapThrN; t++) {
+                                    var d = s - t
+                                    if (d < 0 || d >= mapDutyN) continue
+                                    if (t+1 >= mapThrN || d+1 >= mapDutyN) continue
+                                    var v00 = getCell(t, d), v10 = getCell(t+1, d)
+                                    var v01 = getCell(t, d+1), v11 = getCell(t+1, d+1)
+                                    var p00 = project(t, d, v00)
+                                    var p10 = project(t+1, d, v10)
+                                    var p01 = project(t, d+1, v01)
+                                    var p11 = project(t+1, d+1, v11)
+                                    var avg = (v00+v10+v01+v11)/4
+                                    var col = valueColor(avg)
+                                    ctx.fillStyle = Qt.rgba(col.r, col.g, col.b, 1)
+                                    ctx.beginPath()
+                                    ctx.moveTo(p00.x, p00.y)
+                                    ctx.lineTo(p10.x, p10.y)
+                                    ctx.lineTo(p11.x, p11.y)
+                                    ctx.lineTo(p01.x, p01.y)
+                                    ctx.closePath()
+                                    ctx.fill()
+                                    ctx.strokeStyle = "rgba(0,0,0,0.25)"
+                                    ctx.stroke()
+                                }
+                            }
+                        } catch (e) {
+                            ctx.fillStyle = "#ff5555"
+                            ctx.font = "15px sans-serif"
+                            ctx.textAlign = "left"
+                            ctx.fillText("Draw error: " + e, 8, 20)
+                        }
+                    }
+                    Connections { target: mainItem; function onMapDataChanged() { isoCanvas.requestPaint() } }
+                    onRowBaseChanged: requestPaint()
+                    Connections { target: iso3DTab; function onRotDegChanged() { isoCanvas.requestPaint() } }
+                    Connections { target: iso3DTab; function onTiltFactorChanged() { isoCanvas.requestPaint() } }
+                    onWidthChanged: requestPaint()
+                    onHeightChanged: requestPaint()
+                    Component.onCompleted: requestPaint()
+                }
+
+                // Cheap overlay for just the live point - see the same
+                // split on the Map tab's heatmap for why.
+                Canvas {
+                    id: isoDot
+                    anchors.fill: isoCanvas
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        var ti = rowPosOf(liveSigned())
+                        var di = Math.abs(liveDuty) * (mapDutyN-1)
+                        var lp = isoCanvas.project(ti, di, liveCurRel)
+                        ctx.beginPath(); ctx.arc(lp.x, lp.y, 5, 0, 2*Math.PI)
+                        ctx.fillStyle = "#00e5ff"; ctx.fill()
+                        ctx.strokeStyle = "#003"; ctx.stroke()
+                    }
+                    Connections { target: mainItem; function onLiveDutyChanged() { isoDot.requestPaint() } }
+                    Connections { target: mainItem; function onLiveThrottleChanged() { isoDot.requestPaint() } }
+                    Connections { target: mainItem; function onLiveBrakeChanged() { isoDot.requestPaint() } }
+                    Connections { target: mainItem; function onLiveCurRelChanged() { isoDot.requestPaint() } }
+                    Connections { target: iso3DTab; function onRotDegChanged() { isoDot.requestPaint() } }
+                    Connections { target: iso3DTab; function onTiltFactorChanged() { isoDot.requestPaint() } }
+                    onWidthChanged: requestPaint()
+                    onHeightChanged: requestPaint()
+                    Component.onCompleted: requestPaint()
+                }
+
+                Label {
+                    text: "Pseudo-3D (isometric Canvas). X = Duty, depth = Throttle, height/color = Current Rel."
+                    color: "#777"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 6
+                    wrapMode: Text.WordWrap
+                }
+            }
+
+            ColumnLayout {
+                x: 0; y: iso3DTab.canvasH + 8
+                width: iso3DTab.width
+                height: iso3DTab.controlsH
+                spacing: 4
+                // Stacked, not side by side - two Layout.preferredWidth:
+                // 200 sliders in one RowLayout need ~500px+ combined and
+                // never shrink below that, which is exactly the class of
+                // bug found on the Map/Configurator tabs. A full-width
+                // slider on its own row has no such minimum.
+                RowLayout { Layout.fillWidth: true
+                    Label { text: "Rotation"; color: "#ccc" }
+                    Slider {
+                        Layout.fillWidth: true
+                        from: 0; to: 360
+                        value: iso3DTab.rotDeg
+                        onMoved: iso3DTab.rotDeg = value
+                    }
+                    Label { text: Math.round(iso3DTab.rotDeg) + "°"; color: "#fff" }
+                }
+                RowLayout { Layout.fillWidth: true
+                    Label { text: "Tilt"; color: "#ccc" }
+                    Slider {
+                        Layout.fillWidth: true
+                        from: 0.15; to: 1.3
+                        value: iso3DTab.tiltFactor
+                        onMoved: iso3DTab.tiltFactor = value
+                    }
+                    Label { text: iso3DTab.tiltFactor.toFixed(2); color: "#fff" }
+                }
+            }
+        }
+    }
+
+    // =================================================================
+    // Tab: Configurator (presets + parametric map generation + throttle
+    // source setup + save/load/reset + text export/import)
+    // =================================================================
+    Component {
+        id: configuratorTabComponent
+        Item {
+            id: cfgTab
+            width: stackLayout.width
+            height: stackLayout.height
+
+            // Preset selection and the 8 map-shaping sliders now live on
+            // the Map tab itself (see mapTabComponent), so you can watch
+            // the heatmap react as you drag them - applyPresetValues/
+            // regenerateLocalMap/presets are shared globals on mainItem,
+            // not duplicated here.
+
+            Flickable {
+                id: cfgFlick
+                anchors.fill: parent
+                clip: true
+                contentWidth: width
+                contentHeight: cfgCol.implicitHeight + 16
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn; width: 14 }
+                ColumnLayout {
+                    id: cfgCol
+                    width: cfgFlick.width - 20
+                    spacing: 10
+
+                    Label {
+                        text: "Preset and map-shaping sliders (Torque response, Speed coupling, " +
+                              "Transition width/shape, High throttle hold, Engine braking, Overrun " +
+                              "regen, Regen curve) are on the Map tab now, right above the heatmap, " +
+                              "so you can see the map update live as you adjust them."
+                        color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    Label { text: "Throttle source"; font.bold: true; color: "#ddd" }
+                    RowLayout {
+                        ComboBox {
+                            id: srcCombo
+                            model: ["ADC", "PPM", "UART", "Test (bench, via USB)"]
+                            currentIndex: thrSource
+                            onActivated: (idx) => { thrSource = idx; sendSetThrottle() }
+                        }
+                        CheckBox { text: "Invert"; checked: thrInvert === 1; onToggled: thrInvert = checked ? 1 : 0 }
+                    }
+                    ColumnLayout {
+                        visible: thrSource === 0
+                        Layout.fillWidth: true
+                        spacing: 2
+                        Label { text: "Braking (ADC only)"; color: "#ccc" }
+                        ComboBox {
+                            Layout.fillWidth: true
+                            model: ["Off (map's engine braking only)",
+                                    "Dual channel: brake on ADC2, own 0-100%",
+                                    "Bidirectional: one ADC1, center = neutral"]
+                            currentIndex: thrBrakeMode
+                            onActivated: (idx) => { thrBrakeMode = idx; sendSetThrottle() }
+                        }
+                    }
+                    Label {
+                        visible: thrSource === 0 && thrBrakeMode === 1
+                        text: "Dual channel: for a separate accelerator + brake pedal/lever, each giving its own independent 0-100% signal (ADC1 = accel, ADC2 = brake)."
+                        color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    Label {
+                        visible: thrSource === 0 && thrBrakeMode === 2
+                        text: "Bidirectional: a single ADC1 input, center-zero - above center is accelerator, below is brake. Uses the ADC app's own start/center/end calibration from App Settings -> ADC (conf-get 'adc-v1-start/-center/-end), not this package's own Min/Max below."
+                        color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    Label {
+                        visible: thrSource === 0 && thrBrakeMode !== 0
+                        text: cfgBrakeMap === 1
+                            ? "The brake side reads the negative half of the map: how hard it brakes depends on both lever travel and speed, exactly like the traction half."
+                            : "Either mode overrides the map with a direct, proportional negative current-rel whenever the brake side is above its deadband."
+                        color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    Label { text: "Braking"; font.bold: true; color: "#ddd" }
+                    CheckBox {
+                        text: "Tunable brake map (negative throttle rows)"
+                        checked: cfgBrakeMap === 1
+                        onToggled: { cfgBrakeMap = checked ? 1 : 0; sendSetConfig(false) }
+                    }
+                    Label {
+                        text: cfgBrakeMap === 1
+                            ? "The map grows downwards to -100% throttle: 10 extra rows you tune the same way as the traction ones. Default is a straight proportional brake, flat across duty; no slider ever overwrites these rows, only Reset to defaults does."
+                            : "Off: the brake lever commands a plain proportional brake, unchanged from the stable package. Turn it on to shape braking against speed too."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    Label { text: "Brake type"; color: "#ccc" }
+                    ComboBox {
+                        Layout.fillWidth: true
+                        model: ["Regen only - no negative torque",
+                                "Current, no reverse",
+                                "Current, bidirectional (reverse)"]
+                        currentIndex: cfgBrakeType
+                        onActivated: (idx) => { cfgBrakeType = idx; sendSetConfig(false) }
+                    }
+                    Label {
+                        text: ["Regen only: braking is set-brake-rel throughout, so the motor never produces torque against the direction of travel and never reverses.",
+                               "Current, no reverse: regen while rolling, then negative current below the threshold below so it pulls itself to a stop and holds - but it brakes again instead of driving if it ever starts rolling backwards.",
+                               "Current, bidirectional: same as above, and once stopped it keeps going into reverse."][cfgBrakeType]
+                        color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    ColumnLayout {
+                        visible: cfgBrakeType !== 0
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Switch to torque below (ERPM)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 70
+                                horizontalAlignment: TextInput.AlignRight
+                                text: cfgRevErpm.toFixed(0)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0, 20000)
+                                    if (v !== null) { cfgRevErpm = Math.round(v); sendSetConfig(false) }
+                                    text = Qt.binding(function() { return cfgRevErpm.toFixed(0) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0; to: 5000; stepSize: 50
+                            value: cfgRevErpm
+                            onMoved: cfgRevErpm = Math.round(value)
+                            onPressedChanged: if (!pressed) sendSetConfig(false)
+                        }
+                    }
+                    Label {
+                        text: "Engine braking and overrun regen always stay pure regen whatever this is set to - only the brake lever itself can command negative torque."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    // No ADC/PPM/UART hardware wired up yet? Pick "Test
+                    // (bench, via USB)" above, then drag this - it drives
+                    // the real control loop over the same USB/CAN link
+                    // VESC Tool is already connected through, no wiring
+                    // needed. See SET_TEST_THROTTLE in docs/protocol.md.
+                    ColumnLayout {
+                        visible: thrSource === 3
+                        Layout.fillWidth: true
+                        Label { text: "Bench throttle (test source)"; font.bold: true; color: "#ddd" }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Slider {
+                                id: benchThrottle
+                                Layout.fillWidth: true
+                                from: cfgBrakeMap === 1 ? -1 : 0; to: 1
+                                value: mainItem.benchValue
+                                onMoved: sendTestThrottle(value)
+                                onPressedChanged: if (!pressed) sendTestThrottle(value)
+                            }
+                            Label { text: (benchThrottle.value*100).toFixed(0) + " %"; color: "#fff" }
+                            Button {
+                                text: "STOP"
+                                Material.background: "#b23b3b"
+                                onClicked: { benchThrottle.value = 0; sendTestThrottle(0) }
+                            }
+                        }
+                        Label {
+                            text: "STOP clears the bench throttle immediately. Link loss clears the command after 500 ms."
+                            color: "#996"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Min (raw 0..1)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: thrMin.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0, 0.5)
+                                        if (v !== null) thrMin = v
+                                        text = Qt.binding(function() { return thrMin.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0; to: 0.5; value: thrMin; onMoved: thrMin = value }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Max (raw 0..1)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: thrMax.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.5, 1.0)
+                                        if (v !== null) thrMax = v
+                                        text = Qt.binding(function() { return thrMax.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.5; to: 1.0; value: thrMax; onMoved: thrMax = value }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Deadband"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: thrDeadband.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0, 0.15)
+                                        if (v !== null) thrDeadband = v
+                                        text = Qt.binding(function() { return thrDeadband.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0; to: 0.15; value: thrDeadband; onMoved: thrDeadband = value }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Filter (1.0 = off)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: thrFilter.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.001, 1.0)
+                                        if (v !== null) thrFilter = v
+                                        text = Qt.binding(function() { return thrFilter.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.001; to: 1.0; value: thrFilter; onMoved: thrFilter = value }
+                        }
+                    }
+                    Button { text: "Apply throttle settings"; onClicked: sendSetThrottle() }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    Label { text: "Persistence"; font.bold: true; color: "#ddd" }
+                    // Flow, not RowLayout: 4 buttons with fairly long
+                    // labels never shrink and never wrap in a RowLayout,
+                    // which was overflowing narrow widths - Flow wraps
+                    // to a new line instead of forcing the row wider.
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Button { text: "Save to VESC"; onClicked: sendSave() }
+                        Button { text: "Load from VESC"; onClicked: { sendLoad(); requestMap(); requestCfg() } }
+                        Button { text: "Reset to defaults"; onClicked: { sendReset(); requestMap(); requestCfg() } }
+                        Button { text: "Refresh from VESC"; onClicked: { requestMap(); requestCfg() } }
+                    }
+                    // lastCmdStatus gets set on every STATUS reply (see
+                    // handleRx) but had nowhere to show up before. Save
+                    // especially pauses the motor for a few seconds (see
+                    // docs/map_format.md), so confirming it actually
+                    // landed matters here.
+                    Label {
+                        text: lastCmdStatus
+                        color: "#9bd"; Layout.fillWidth: true; elide: Text.ElideRight
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    Label { text: "Export / Import (text)"; font.bold: true; color: "#ddd" }
+                    Label {
+                        text: "There is no supported way for a package's QML to write an arbitrary local file in VESC Tool, so export/import goes through plain text you copy/paste yourself."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Button { text: "Export to text"; onClicked: exportArea.text = JSON.stringify({ map: mapData, cfg: {
+                            preset: cfgPreset, torqueResp: cfgTorqueResp, speedCoupling: cfgSpeedCoupling,
+                            transWidth: cfgTransWidth, transShape: cfgTransShape, highHold: cfgHighHold,
+                            engineBrake: cfgEngineBrake, overrunRegen: cfgOverrunRegen, regenCurve: cfgRegenCurve,
+                            thrSource: thrSource, thrInvert: thrInvert, thrMin: thrMin, thrMax: thrMax,
+                            thrDeadband: thrDeadband, thrFilter: thrFilter, thrBrakeMode: thrBrakeMode,
+                            brakeMap: cfgBrakeMap, brakeType: cfgBrakeType, revErpm: cfgRevErpm } }) }
+                        Button {
+                            text: "Import from text"
+                            onClicked: {
+                                try {
+                                    var obj = JSON.parse(exportArea.text)
+                                    validateImport(obj)
+                                    mapData = obj.map.map(quantizeCell)
+                                    if (obj.cfg) {
+                                        cfgPreset = obj.cfg.preset; cfgTorqueResp = obj.cfg.torqueResp
+                                        cfgSpeedCoupling = obj.cfg.speedCoupling; cfgTransWidth = obj.cfg.transWidth
+                                        cfgTransShape = obj.cfg.transShape; cfgHighHold = obj.cfg.highHold
+                                        cfgEngineBrake = obj.cfg.engineBrake; cfgOverrunRegen = obj.cfg.overrunRegen
+                                        cfgRegenCurve = obj.cfg.regenCurve; thrSource = obj.cfg.thrSource
+                                        thrInvert = obj.cfg.thrInvert; thrMin = obj.cfg.thrMin; thrMax = obj.cfg.thrMax
+                                        thrDeadband = obj.cfg.thrDeadband; thrFilter = obj.cfg.thrFilter
+                                        thrBrakeMode = obj.cfg.thrBrakeMode === undefined ? 0 : obj.cfg.thrBrakeMode
+                                        cfgBrakeMap = obj.cfg.brakeMap === undefined ? 0 : obj.cfg.brakeMap
+                                        cfgBrakeType = obj.cfg.brakeType === undefined ? 0 : obj.cfg.brakeType
+                                        cfgRevErpm = obj.cfg.revErpm === undefined ? 500 : obj.cfg.revErpm
+                                    }
+                                    regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()
+                                    lastCmdStatus = "Imported from text"
+                                } catch (e) { lastCmdStatus = "Import failed: " + e }
+                            }
+                        }
+                        Button { text: "Copy to clipboard"; onClicked: { exportArea.selectAll(); exportArea.copy() } }
+                    }
+                    Label {
+                        text: lastCmdStatus
+                        color: "#9bd"; Layout.fillWidth: true; elide: Text.ElideRight
+                    }
+                    TextArea {
+                        id: exportArea
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 140
+                        wrapMode: TextArea.Wrap
+                        selectByMouse: true
+                        color: "#ddd"
+                        background: Rectangle { color: "#0e1013"; border.color: "#333" }
+                    }
+                }
+            }
+        }
+    }
+}
