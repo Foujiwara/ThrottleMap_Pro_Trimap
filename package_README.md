@@ -1,43 +1,41 @@
 # CarMap Beta (Brake Map)
 
-**Beta fork of CarMap Thermal Throttle.** A configurable 31 x 11
+**Beta fork of CarMap Thermal Throttle.** A configurable 441-cell
 throttle/duty map drives relative propulsion current and relative brake
 current. Native VESC current, voltage, temperature and speed limits
 remain active.
 
-The vertical axis now spans **-100% to +100% throttle**: rows above zero
-are traction (5% steps, the same resolution as before), rows below zero
-are the brake half (10% steps), reached when the optional **brake map**
-is enabled and the brake lever is pulled. The duty axis moved to 10%
-steps to make room in the EEPROM; the lookup interpolates duty, so
-nothing about the feel changes.
+The grid is **ragged**, on purpose:
+
+- **Traction rows**: throttle 0..100% in 5% steps (the same resolution as
+  the stable package), duty 0..100%.
+- **Brake rows**: lever 0..-100% in 10% steps, duty **-100%..+100%**. The
+  right half is braking against speed, the left half is reverse.
+
+Negative duty under a positive throttle is not stored at all - it only
+ever means "full forward torque" - and that saved space is what pays for
+the traction half keeping its 5% steps.
 
 Each half has its own generator and its own regenerate flag, so shaping
-one never discards hand edits made to the other. The brake cells sit on the same duty axis as the traction ones and shape
-**braking against forward speed** - what riding actually uses. Default is
-flat: -10% lever is -0.10 at any speed. Settings: brake strength at full
-lever, lever response, speed dependence and speed curve.
-
-How far back the lever may drive is a **separate Reverse limit** on the
-Config tab (reverse speed coupling, transition width, runaway hold),
-applied on top of the cells and only while genuinely rolling backwards,
-so limiting reverse never costs braking while riding. With the default
-coupling, 30% of lever backs up to 30% duty and stops pulling.
+one never discards hand edits made to the other. The brake generator
+defaults to -10% lever = -0.10 at any forward speed, backing up to 10%
+duty before it stops pulling.
 
 **Brake type** (lever only):
 
 - *Regen only* - braking never produces torque against travel.
 - *Current, no reverse* - regen while rolling, negative current below the
-  ERPM threshold so it pulls to a stop and holds, and regen again rather
-  than driving if it ever rolls backwards.
+  ERPM threshold so it pulls to a stop, then latched back to regen so it
+  can never shunt backwards.
 - *Current, bidirectional* - as above, then on into reverse once stopped.
 
 Engine braking and overrun regen always stay pure regen regardless, so a
-released throttle can never reverse the vehicle.
+released throttle can never reverse the vehicle. Only a bidirectional
+brake ever reads the reverse columns.
 
 An existing 21x21 EEPROM image is converted on read (old rows become the
-traction half, every other duty column kept). Nothing is written back
-until you Save; going back to the stable package means reconfiguring.
+traction half, every other duty column kept). Earlier beta formats are
+rejected and fall back to defaults.
 
 ## Setup
 

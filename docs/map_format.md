@@ -2,85 +2,78 @@
 
 ## Runtime map
 
-31 throttle points by 11 absolute-duty points.
-Index = throttle_index * 11 + duty_index. Each cell is a signed byte
-in -100..100, representing -1.00..1.00 at 1% resolution.
-The buffer is mutable RAM, never constant flash.
+The grid is deliberately **ragged**, because a rectangular one would spend
+a quarter of the EEPROM on a region with no content: negative duty under a
+positive throttle only ever means "full forward torque".
 
-The throttle axis is signed and has two slopes. Row 10 is zero throttle.
-Rows 10..30 are traction at 5% intervals, so the traction half keeps the
-resolution the 21x21 format had. Rows 0..9 are the brake half at 10%
-intervals, row 0 being -100%. The duty axis is 10% intervals: 21 duty
-columns plus a brake half does not fit 128 EEPROM slots, and the lookup
-interpolates duty anyway.
+| Rows | Throttle | Columns | Duty |
+| --- | --- | --- | --- |
+| 0..9 | brake lever -100%..-10%, 10% steps | 21 | -100%..+100%, 10% steps |
+| 10..30 | throttle 0..100%, 5% steps | 11 | 0..100%, 10% steps |
 
-Lookup accepts throttle in -1000..1000 and duty in 0..1000 and clamps at
-the edges. The row position is `10000 + throttle * (throttle < 0 ? 10 :
-20)`, kept positive so integer `mod` yields the interpolation weight
-directly. It interpolates the four adjacent cells using integer
-arithmetic; the result is scaled by 1000. Positive values command
-relative propulsion current. Negative values command relative brake
-current.
+`10*21 + 21*11 = 441` cells - the same budget a 21x21 grid would have
+used, but the traction half keeps its 5% throttle steps and the brake half
+gains a full reverse region. Each cell is a signed byte in -100..100,
+representing -1.00..1.00 at 1% resolution. The buffer is mutable RAM,
+never constant flash.
 
-The brake half is only reached when the brake map is enabled and the
-brake channel is above its deadband; otherwise the lever keeps the plain
-proportional behaviour and only rows 10..30 are ever read.
+Row 10 is zero throttle. Zero lever is not stored: it is zero by
+definition, and having it as an implicit row lets a light pull fade in
+from nothing instead of jumping to the -10% row.
 
-The generator computes peak = throttle ^ torque_response, then blends
-towards throttle above 60% according to high_hold. An exponent below 1
-increases low-throttle response; above 1 softens it. With nonzero speed
-coupling, balance duty = clamp(throttle * coupling), with a shaped taper
-over transition_width before balance and overrun regen after balance.
-The released row uses -engine_brake * duty ^ (1 + regen_curve).
-Zero speed coupling selects duty-independent torque (Direct Electric),
-while retaining the released-row brake. QML previews the same formula.
+## Lookup
 
-**The thermal generator writes rows 10..30 only.** The brake half has a
-generator of its own, on its own flag, and neither half can overwrite the
-other:
+Two lookups, each bilinear on its own uniform grid; nothing ever blends
+across the seam, since throttle and brake are separate inputs.
 
-The brake rows sit on the **same |duty| axis as the traction rows**, so
-the whole map reads one way: how hard the lever brakes at each speed.
+- **throttle >= 0**: rows 10..30 against duty clamped to 0..1000, so
+  rolling backwards reads column 0 - full forward torque, not the fade a
+  high forward speed would have produced.
+- **throttle < 0**: the brake rows against signed duty -1000..1000.
 
-```
-peak  = brake_strength * lever ^ brake_response
-speed = (1 - duty_dep) + duty_dep * duty ^ (1 + brake_curve)
-cell  = -(peak * clamp01(speed))
-```
+Positive values command relative propulsion current, negative values
+relative brake current. All intermediates fit the VESC signed 28-bit
+inline integer.
 
-Defaults 1.0 / 1.0 / 0.0 / 0 give `-lever`, flat across speed: -10% lever
-is -0.10 at any duty. Raising duty_dep fades braking out towards a
-standstill.
+## Generators
 
-## Reverse limit
+Traction rows come from the thermal law: peak = throttle ^ torque_response
+blended towards throttle above 60% by high_hold, a balance duty of
+clamp(throttle * coupling), a shaped taper over transition_width before
+it and overrun regen after. The released row uses
+`-engine_brake * duty ^ (1 + regen_curve)`. Zero speed coupling selects
+duty-independent torque (Direct Electric). QML previews the same formula.
 
-How far back the lever may drive is **not** in the cells. Putting it
-there would spend all 11 columns on a low-speed manoeuvre and leave
-braking-while-riding as a single number per row. It is a separate
-closed-form limiter (`brake-reverse` in package.lisp), applied on top of
-the cell value and only while the controller is genuinely travelling
-backwards - so it can never cost braking on the way there:
+Brake rows have their own generator and their own regenerate flag, so
+neither half can overwrite the other:
 
 ```
-balance = clamp(lever * rev_coupling)
-start   = max(0, balance - rev_width)
+peak    = brake_strength * lever ^ brake_response
 
-rev <= start    : cell                        pulling backwards
-rev <= balance  : cell * (1 - p^2)            fading to its reverse speed
-rev >  balance  : +rev_overrun * over^2       forward torque, pulls it back
+duty > 0  (braking against speed)
+    -(peak * ((1 - duty_dep) + duty_dep * duty ^ (1 + brake_curve)))
+
+duty <= 0 (reverse)
+    balance = clamp01(lever * rev_coupling)
+    start   = clamp01(balance - rev_width)
+    rev <= start    : -peak
+    rev <= balance  : -peak * (1 - p^2)
+    rev >  balance  : +rev_overrun * over^2
 ```
 
-Defaults 1.0 / 0.10 / 0.12: 30% of lever backs up to 30% duty and stops
-pulling. `rev_coupling = 0` removes the limit. The parameters are stored
-and carried as integers scaled by 1000, because unlike the generator
-settings they are read by the control loop on every braking tick.
+Defaults 1.0 / 1.0 / 0.0 / 0 and 1.0 / 0.10 / 0.12: -10% lever is -0.10 at
+any forward speed, and backs up to 10% duty before it stops pulling.
+`duty_dep` fades braking out towards a standstill; `rev_coupling = 0`
+removes the reverse balance.
 
-Only a bidirectional brake reaches this at all; the other two types
-cannot travel backwards under power.
+The positive cells past the reverse balance are forward torque, which
+holds a reverse that is running away. Only a bidirectional brake reaches
+them - for the other two types the control loop clamps the lever result to
+zero or below, so the brake half is pure braking.
 
 ## Brake type
 
-Independent of the map, and applied to the brake lever only:
+Applied to the brake lever only:
 
 | Value | Behaviour |
 | --- | --- |
@@ -95,12 +88,9 @@ merely released.
 
 ## EEPROM layout
 
-There are 128 persistent 32-bit slots. Format marker 20260917. The header
-is packed into 9 slots (i16 scaled by 1000 instead of float32) so that
-the taller map still fits, and the brake generator sits in a two-slot
-tail *after* the map, so an earlier beta image (20260914..20260916) is a
-readable prefix of this one: it loads normally and the brake-generator
-and reverse-limit settings fall back to their defaults.
+There are 128 persistent 32-bit slots. Format marker 20260918. The header
+is packed into 9 slots (i16 scaled by 1000 instead of float32) and the
+generator settings sit in a tail after the map.
 
 | Offset | Content |
 | --- | --- |
@@ -113,12 +103,11 @@ and reverse-limit settings fall back to their defaults.
 | 24, 26 | Engine brake, overrun regen |
 | 28..31 | Transition shape, regen curve, brake map on, brake type (u8 each) |
 | 32 | Reverse-threshold ERPM, i16 |
-| 36..379 | Four map bytes per word; first cell in least significant byte |
-| 380..392 | Brake strength, response, speed dependence (i16 x1000), speed curve (u8), then reverse coupling, width, overrun (i16 x1000) |
+| 36..479 | Four map bytes per word; first cell in least significant byte |
+| 480..492 | Brake strength, response, speed dependence (i16 x1000), speed curve (u8), then reverse coupling, width, overrun (i16 x1000) |
 | Slot 127 | CRC16 of slots 0..126 encoded as big-endian words |
 
-That is 99 of the 127 data slots; the remaining ones are written as zero
-and are free for later use.
+That is 124 of the 127 data slots; the remaining ones are written as zero.
 
 Each cell is stored as signed_value + 128. Padding cells in the last slot
 represent zero. Packing promotes to u32 **before** shifts; ordinary Lisp
@@ -142,8 +131,12 @@ at boot only, failed load generates the default map.
 Markers 20260913 and 20260912 are read, validated against the old layout
 and converted in memory: the 21 old throttle rows become rows 10..30
 unchanged, the duty axis keeps every other column (old index `2*d`, which
-lands exactly on the new 10% grid), and the brake half is filled with the
-default proportional brake. Brake map off, brake type regen-only.
+lands exactly on the new 10% grid), and the brake half is generated.
+Brake map off, brake type regen-only.
+
+Earlier **beta** markers are rejected outright rather than migrated: their
+geometry differs, and a wrong reading would be worse than falling back to
+defaults.
 
 Nothing is written back until the next explicit Save, which stores the
 new format. The conversion is one-way: a stable-package install reading
