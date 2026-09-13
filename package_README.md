@@ -12,9 +12,13 @@ is enabled and the brake lever is pulled. The duty axis moved to 10%
 steps to make room in the EEPROM; the lookup interpolates duty, so
 nothing about the feel changes.
 
-Presets and the shaping sliders rewrite the traction rows only. The brake
-rows are yours: only **Reset to defaults** refills them, with a straight
-proportional brake.
+Each half has its own generator and its own regenerate flag, so shaping
+one never discards hand edits made to the other. The brake generator
+defaults to a negative current **proportional to both lever travel and
+duty** - the mirror of the traction side, no bite at a standstill, full
+bite at full speed - and exposes four settings: brake strength at full
+lever, lever response, speed dependence (0 makes it flat across speed,
+i.e. the plain proportional lever brake) and the speed curve.
 
 **Brake type** (lever only):
 

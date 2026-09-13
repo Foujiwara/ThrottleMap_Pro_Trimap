@@ -24,6 +24,11 @@
 ; 0 regen only, 1 current no reverse, 2 current bidirectional.
 (define cfg-brake-type 0)
 (define cfg-rev-erpm 500)
+; Brake half generator - see gen-brake-map in map.lisp.
+(define cfg-brake-str 1.0)
+(define cfg-brake-resp 1.0)
+(define cfg-brake-dep 1.0)
+(define cfg-brake-curve 0)
 (define live-throttle 0)
 (define live-duty 0)
 (define live-cur-rel 0)
@@ -32,7 +37,7 @@
 (define brake-stopped nil)
 ; One buffer per owner: telemetry never shares its buffer with the event task.
 (define row-packet (array-create 24))
-(define cfg-packet (array-create 31))
+(define cfg-packet (array-create 38))
 
 @const-start
 ; Lever braking only. Engine braking and overrun regen always stay pure
@@ -137,6 +142,10 @@
         (bufset-u8 b 27 cfg-brake-map)
         (bufset-u8 b 28 cfg-brake-type)
         (bufset-i16 b 29 cfg-rev-erpm)
+        (bufset-i16 b 31 (fx-enc cfg-brake-str))
+        (bufset-i16 b 33 (fx-enc cfg-brake-resp))
+        (bufset-i16 b 35 (fx-enc cfg-brake-dep))
+        (bufset-u8 b 37 cfg-brake-curve)
         (proto-send b))))
 
 (defun packet-valid (data)
@@ -156,7 +165,7 @@
                                         (setq ok nil)))
                                 ok))))
                     ((= cmd pkt-set-config)
-                        (and (= n 21) (<= (bufget-u8 data 1) 4)
+                        (and (= n 29) (<= (bufget-u8 data 1) 4)
                              (in-range (bufget-i16 data 2) 300 2000)
                              (in-range (bufget-i16 data 4) 0 1500)
                              (in-range (bufget-i16 data 6) 20 300)
@@ -168,7 +177,12 @@
                              (<= (bufget-u8 data 16) 1)
                              (<= (bufget-u8 data 17) 1)
                              (<= (bufget-u8 data 18) 2)
-                             (in-range (bufget-i16 data 19) 0 20000)))
+                             (in-range (bufget-i16 data 19) 0 20000)
+                             (in-range (bufget-i16 data 21) 0 1000)
+                             (in-range (bufget-i16 data 23) 300 2000)
+                             (in-range (bufget-i16 data 25) 0 1000)
+                             (<= (bufget-u8 data 27) 3)
+                             (<= (bufget-u8 data 28) 1)))
                     ((= cmd pkt-set-thr)
                         (and (= n 12) (<= (bufget-u8 data 1) 3)
                              (<= (bufget-u8 data 2) 1)
@@ -204,10 +218,17 @@
                     (setq cfg-brake-map (bufget-u8 data 17))
                     (setq cfg-brake-type (bufget-u8 data 18))
                     (setq cfg-rev-erpm (bufget-i16 data 19))
-                    ; Regenerating never touches the hand-tuned brake rows.
+                    (setq cfg-brake-str (fx-dec (bufget-i16 data 21)))
+                    (setq cfg-brake-resp (fx-dec (bufget-i16 data 23)))
+                    (setq cfg-brake-dep (fx-dec (bufget-i16 data 25)))
+                    (setq cfg-brake-curve (bufget-u8 data 27))
+                    ; Each half regenerates on its own flag: a traction
+                    ; slider never rewrites brake rows, and vice versa.
                     (if (= (bufget-u8 data 16) 1)
                         (gen-thermal-map cfg-torque-resp cfg-speed-coupling cfg-trans-width
-                            cfg-trans-shape cfg-high-hold cfg-engine-brake cfg-overrun-regen cfg-regen-curve))))
+                            cfg-trans-shape cfg-high-hold cfg-engine-brake cfg-overrun-regen cfg-regen-curve))
+                    (if (= (bufget-u8 data 28) 1)
+                        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve))))
             ((= cmd pkt-set-thr)
                 (progn
                     (setq thr-cfg-source (bufget-u8 data 1))

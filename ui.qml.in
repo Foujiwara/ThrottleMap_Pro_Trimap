@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 2
+    property int buildMarker: 3
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -120,6 +120,11 @@ Item {
     // 0 regen only, 1 current no reverse, 2 current bidirectional
     property int cfgBrakeType: 0
     property int cfgRevErpm: 500
+    // Brake half generator - mirrors gen-brake-map in map.lisp
+    property real cfgBrakeStr: 1.0
+    property real cfgBrakeResp: 1.0
+    property real cfgBrakeDep: 1.0
+    property int cfgBrakeCurve: 0
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
     property int thrInvert: 0
@@ -148,6 +153,10 @@ Item {
             if (c.brakeMap !== undefined) range(c.brakeMap,0,1,true)
             if (c.brakeType !== undefined) range(c.brakeType,0,2,true)
             if (c.revErpm !== undefined) range(c.revErpm,0,20000,true)
+            if (c.brakeStr !== undefined) range(c.brakeStr,0,1,false)
+            if (c.brakeResp !== undefined) range(c.brakeResp,0.3,2,false)
+            if (c.brakeDep !== undefined) range(c.brakeDep,0,1,false)
+            if (c.brakeCurve !== undefined) range(c.brakeCurve,0,3,true)
         }
     }
 
@@ -208,7 +217,10 @@ Item {
     }
     function sendAllRows() { for (var t = 0; t < mapThrN; t++) sendSetMapRow(t) }
 
-    function sendSetConfig(regenerate) {
+    // Two independent regenerate flags: a traction slider must not
+    // rewrite the brake rows, and a brake slider must not rewrite the
+    // traction ones.
+    function sendSetConfig(regenerate, regenBrake) {
         var b = [cmdSetConfig, cfgPreset & 0xff]
         b = b.concat(i16Bytes(fxEnc(cfgTorqueResp)))
         b = b.concat(i16Bytes(fxEnc(cfgSpeedCoupling)))
@@ -222,6 +234,11 @@ Item {
         b.push(cfgBrakeMap & 0xff)
         b.push(cfgBrakeType & 0xff)
         b = b.concat(i16Bytes(cfgRevErpm))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeStr)))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeResp)))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeDep)))
+        b.push(cfgBrakeCurve & 0xff)
+        b.push(regenBrake === true ? 1 : 0)
         sendPacket(b)
     }
     function sendSetThrottle() {
@@ -238,6 +255,7 @@ Item {
         if (pendingPacket !== null || txQueue.length > 0) { lastCmdStatus = "Wait for the current transfer before saving"; return }
         if (!mapReceived || !cfgReceived) { lastCmdStatus = "Read map and settings before saving"; return }
         if (regenDebounce.running) { regenDebounce.stop(); regenerateLocalMap() }
+        if (brakeRegenDebounce.running) { brakeRegenDebounce.stop(); regenerateLocalBrake() }
         lastCmdStatus = "Uploading and saving…"
         sendSetConfig(false); sendSetThrottle(); sendAllRows(); sendPacket([cmdSave])
     }
@@ -355,7 +373,7 @@ Item {
             pendingPacket = null
             pumpTx()
         } else if (cmd === rxCfgEcho) {
-            if (view.byteLength !== 31) return
+            if (view.byteLength !== 38) return
             cfgReceived = true
             cfgPreset = view.getUint8(1)
             cfgTorqueResp = fxDec(view.getInt16(2, false))
@@ -376,6 +394,10 @@ Item {
             cfgBrakeMap = view.getUint8(27)
             cfgBrakeType = view.getUint8(28)
             cfgRevErpm = view.getInt16(29, false)
+            cfgBrakeStr = fxDec(view.getInt16(31, false))
+            cfgBrakeResp = fxDec(view.getInt16(33, false))
+            cfgBrakeDep = fxDec(view.getInt16(35, false))
+            cfgBrakeCurve = view.getUint8(37)
         }
     }
 
@@ -449,6 +471,24 @@ Item {
     // the user stops moving the slider, not on every pixel of the drag.
     property Timer regenDebounce: Timer { interval: 60; onTriggered: regenerateLocalMap() }
     function requestRegen() { regenDebounce.restart() }
+    property Timer brakeRegenDebounce: Timer { interval: 60; onTriggered: { regenerateLocalBrake(); sendSetConfig(false, true) } }
+    function requestBrakeRegen() { brakeRegenDebounce.restart() }
+
+    // QML mirror of gen-brake-map: the brake half of the map, negative
+    // current scaled by lever travel and (by default) by duty too.
+    function regenerateLocalBrake() {
+        var arr = mapData.slice()
+        for (var bi = 0; bi < mapThrZero; bi++) {
+            var lever = (mapThrZero - bi) / 10.0
+            var peak = cfgBrakeStr * Math.pow(lever, cfgBrakeResp)
+            for (var di = 0; di < mapDutyN; di++) {
+                var duty = di / (mapDutyN - 1)
+                var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
+                arr[cellIdx(bi, di)] = quantizeCell(-peak * Math.max(0, Math.min(1, speed)))
+            }
+        }
+        mapData = arr
+    }
 
     // Traction half only: the brake rows are hand territory and no
     // slider ever rewrites them (gen-thermal-map in map.lisp matches).
@@ -973,6 +1013,114 @@ Item {
                     Button {
                         text: "Send to VESC (generate authoritative map)"
                         onClicked: { regenDebounce.stop(); regenerateLocalMap(); sendSetConfig(); requestMap() }
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333"; visible: cfgBrakeMap === 1 }
+
+                    // Second generator, for the brake half only. Separate
+                    // from the traction sliders above on purpose: each
+                    // half regenerates on its own flag, so shaping one
+                    // never discards hand edits made to the other.
+                    ColumnLayout {
+                        visible: cfgBrakeMap === 1
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        Label { text: "Brake curve (negative rows)"; font.bold: true; color: "#ddd" }
+                        Label {
+                            text: "Default is a negative current proportional to both lever travel and duty, the mirror of the traction side: no bite at a standstill, full bite at full speed."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            Button {
+                                text: "Regenerate brake"
+                                onClicked: { brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true) }
+                            }
+                            Button {
+                                text: "Default brake curve"
+                                onClicked: {
+                                    cfgBrakeStr = 1.0; cfgBrakeResp = 1.0
+                                    cfgBrakeDep = 1.0; cfgBrakeCurve = 0
+                                    brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true)
+                                }
+                            }
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Brake strength at full lever"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgBrakeStr.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.0)
+                                        if (v !== null) { cfgBrakeStr = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeStr.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgBrakeStr; onMoved: { cfgBrakeStr = value; requestBrakeRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Lever response"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgBrakeResp.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.3, 2.0)
+                                        if (v !== null) { cfgBrakeResp = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeResp.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.3; to: 2.0; value: cfgBrakeResp; onMoved: { cfgBrakeResp = value; requestBrakeRegen() } }
+                        }
+                        Label {
+                            text: "Below 1.00 the first part of the lever travel bites harder; above 1.00 it stays soft and firms up at the end."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Speed dependence"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgBrakeDep.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.0)
+                                        if (v !== null) { cfgBrakeDep = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeDep.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgBrakeDep; onMoved: { cfgBrakeDep = value; requestBrakeRegen() } }
+                        }
+                        Label {
+                            text: "1.00 scales braking with duty, like the traction side. 0.00 makes it flat across speed, which is the plain proportional lever brake."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Speed curve"; color: "#ccc" }
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: ["Linear", "Squared", "Cubed", "Fourth power"]
+                                currentIndex: cfgBrakeCurve
+                                onActivated: (idx) => { cfgBrakeCurve = idx; requestBrakeRegen() }
+                            }
+                        }
+                        Label {
+                            text: "How the speed term ramps up. Linear is proportional; the higher powers keep braking gentle at low speed and pile it on near full duty."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
                     }
 
                     Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
@@ -1559,7 +1707,7 @@ Item {
                     }
                     Label {
                         text: cfgBrakeMap === 1
-                            ? "The map grows downwards to -100% throttle: 10 extra rows you tune the same way as the traction ones. Default is a straight proportional brake, flat across duty; no slider ever overwrites these rows, only Reset to defaults does."
+                            ? "The map grows downwards to -100% throttle: 10 extra rows you tune the same way as the traction ones, with their own generator on the Map tab. The traction sliders never touch them, and their generator never touches the traction rows."
                             : "Off: the brake lever commands a plain proportional brake, unchanged from the stable package. Turn it on to shape braking against speed too."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
@@ -1753,7 +1901,9 @@ Item {
                             engineBrake: cfgEngineBrake, overrunRegen: cfgOverrunRegen, regenCurve: cfgRegenCurve,
                             thrSource: thrSource, thrInvert: thrInvert, thrMin: thrMin, thrMax: thrMax,
                             thrDeadband: thrDeadband, thrFilter: thrFilter, thrBrakeMode: thrBrakeMode,
-                            brakeMap: cfgBrakeMap, brakeType: cfgBrakeType, revErpm: cfgRevErpm } }) }
+                            brakeMap: cfgBrakeMap, brakeType: cfgBrakeType, revErpm: cfgRevErpm,
+                            brakeStr: cfgBrakeStr, brakeResp: cfgBrakeResp,
+                            brakeDep: cfgBrakeDep, brakeCurve: cfgBrakeCurve } }) }
                         Button {
                             text: "Import from text"
                             onClicked: {
@@ -1773,6 +1923,10 @@ Item {
                                         cfgBrakeMap = obj.cfg.brakeMap === undefined ? 0 : obj.cfg.brakeMap
                                         cfgBrakeType = obj.cfg.brakeType === undefined ? 0 : obj.cfg.brakeType
                                         cfgRevErpm = obj.cfg.revErpm === undefined ? 500 : obj.cfg.revErpm
+                                        cfgBrakeStr = obj.cfg.brakeStr === undefined ? 1.0 : obj.cfg.brakeStr
+                                        cfgBrakeResp = obj.cfg.brakeResp === undefined ? 1.0 : obj.cfg.brakeResp
+                                        cfgBrakeDep = obj.cfg.brakeDep === undefined ? 1.0 : obj.cfg.brakeDep
+                                        cfgBrakeCurve = obj.cfg.brakeCurve === undefined ? 0 : obj.cfg.brakeCurve
                                     }
                                     regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()
                                     lastCmdStatus = "Imported from text"
