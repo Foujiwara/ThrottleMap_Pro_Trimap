@@ -6,11 +6,12 @@
 (define storage-busy nil)
 
 @const-start
-(define eeprom-magic 20260916)
+(define eeprom-magic 20260917)
 ; Earlier betas share this layout minus the brake-generator tail at 380:
 ; they load, and the generator settings fall back to their defaults.
 (define eeprom-magic-b0 20260914)
 (define eeprom-magic-b1 20260915)
+(define eeprom-magic-b2 20260916)
 (define eeprom-legacy-magic 20260913)
 (define eeprom-legacy-magic0 20260912)
 (define eeprom-map-base 36)
@@ -54,10 +55,11 @@
         ; readable prefix of this one.
         (bufset-i16 b 380 (to-fp cfg-brake-str))
         (bufset-i16 b 382 (to-fp cfg-brake-resp))
-        (bufset-i16 b 384 (to-fp cfg-brake-coupling))
-        (bufset-i16 b 386 (to-fp cfg-brake-width))
-        (bufset-i16 b 388 (to-fp cfg-brake-overrun))
-        (bufset-u8 b 390 cfg-brake-curve)
+        (bufset-i16 b 384 (to-fp cfg-brake-dep))
+        (bufset-u8 b 386 cfg-brake-curve)
+        (bufset-i16 b 388 cfg-rev-coupling)
+        (bufset-i16 b 390 cfg-rev-width)
+        (bufset-i16 b 392 cfg-rev-overrun)
         (looprange s 0 eeprom-map-slots
             (bufset-u32 b (+ eeprom-map-base (* s 4))
                 (pack4 (map-cell-flat-i8 (* s 4))
@@ -144,19 +146,21 @@
     (and
         (in-range (bufget-i16 b 380) 0 1000)
         (in-range (bufget-i16 b 382) 300 2000)
-        (in-range (bufget-i16 b 384) 0 1500)
-        (in-range (bufget-i16 b 386) 20 300)
-        (in-range (bufget-i16 b 388) 0 500)
-        (in-range (bufget-u8 b 390) 0 3)))
+        (in-range (bufget-i16 b 384) 0 1000)
+        (in-range (bufget-u8 b 386) 0 3)
+        (in-range (bufget-i16 b 388) 0 1500)
+        (in-range (bufget-i16 b 390) 20 300)
+        (in-range (bufget-i16 b 392) 0 500)))
 
 (defun storage-brake-defaults ()
     (progn
         (setq cfg-brake-str 1.0)
         (setq cfg-brake-resp 1.0)
-        (setq cfg-brake-coupling 1.0)
-        (setq cfg-brake-width 0.10)
-        (setq cfg-brake-overrun 0.12)
-        (setq cfg-brake-curve 0)))
+        (setq cfg-brake-dep 0.0)
+        (setq cfg-brake-curve 0)
+        (setq cfg-rev-coupling 1000)
+        (setq cfg-rev-width 100)
+        (setq cfg-rev-overrun 120)))
 
 (defun storage-apply-image (b)
     (progn
@@ -181,10 +185,11 @@
         (setq cfg-rev-erpm (bufget-i16 b 32))
         (setq cfg-brake-str (fp-to-f (bufget-i16 b 380)))
         (setq cfg-brake-resp (fp-to-f (bufget-i16 b 382)))
-        (setq cfg-brake-coupling (fp-to-f (bufget-i16 b 384)))
-        (setq cfg-brake-width (fp-to-f (bufget-i16 b 386)))
-        (setq cfg-brake-overrun (fp-to-f (bufget-i16 b 388)))
-        (setq cfg-brake-curve (bufget-u8 b 390))
+        (setq cfg-brake-dep (fp-to-f (bufget-i16 b 384)))
+        (setq cfg-brake-curve (bufget-u8 b 386))
+        (setq cfg-rev-coupling (bufget-i16 b 388))
+        (setq cfg-rev-width (bufget-i16 b 390))
+        (setq cfg-rev-overrun (bufget-i16 b 392))
         (looprange i 0 map-cells
             (bufset-i8 map-buf i (storage-image-cell b i)))
         (thr-reset-state)
@@ -241,8 +246,7 @@
             (looprange di 0 11
                 (bufset-i8 map-buf (map-idx (+ ti map-thr-zero) di)
                     (storage-cell-at b 60 (+ (* ti 21) (* di 2))))))
-        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-coupling
-                       cfg-brake-width cfg-brake-overrun cfg-brake-curve)
+        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve)
         (thr-reset-state)
         t))
 
@@ -253,7 +257,8 @@
             nil
             (let ((legacy (or (= magic eeprom-legacy-magic)
                               (= magic eeprom-legacy-magic0)))
-                  (beta0 (or (= magic eeprom-magic-b0) (= magic eeprom-magic-b1))))
+                  (beta0 (or (= magic eeprom-magic-b0) (= magic eeprom-magic-b1)
+                             (= magic eeprom-magic-b2))))
                 (if (not (or legacy beta0 (= magic eeprom-magic)))
                     nil
                     (let ((b (array-create 508)) (ok t))
@@ -313,7 +318,6 @@
         (gen-thermal-map cfg-torque-resp cfg-speed-coupling cfg-trans-width
                          cfg-trans-shape cfg-high-hold cfg-engine-brake
                          cfg-overrun-regen cfg-regen-curve)
-        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-coupling
-                       cfg-brake-width cfg-brake-overrun cfg-brake-curve)
+        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve)
         t))
 @const-end

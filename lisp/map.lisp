@@ -71,36 +71,24 @@
                     (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
                                         width shape brake overrun curve)))))))
 
-; Brake half generator - the mirror of thermal-cell. Its duty axis is
-; REVERSE duty, so column 0 is "not going backwards at all" and holds the
-; full demand for that lever position: -10% lever is -10% current while
-; travelling forwards, at any speed.
-;   peak    = strength * lever ^ response
-;   balance = clamp(lever * coupling)     reverse duty it settles at
-; Below balance it pulls backwards at peak, tapers to zero over width,
-; and past balance turns positive - forward torque, which decelerates a
-; reverse that has run away. coupling 0 removes the balance entirely and
-; leaves a plain plateau.
-(defun brake-cell (b rev strength resp coupling width overrun curve)
-    (let ((peak (* strength (pow b resp))))
-        (if (= coupling 0.0)
-            (- peak)
-            (let ((balance (clamp01 (* b coupling)))
-                  (start (clamp01 (- (clamp01 (* b coupling)) width))))
-                (cond
-                    ((<= rev start) (- peak))
-                    ((<= rev balance)
-                        (- (* peak (- 1.0 (shape-curve
-                            (/ (- rev start) (max-f 0.001 (- balance start))) 1)))))
-                    (t (* overrun (pow
-                        (clamp01 (/ (- rev balance) (max-f 0.001 (- 1.0 balance))))
-                        (+ 1.0 curve)))))))))
+; Brake half generator: braking demand against FORWARD speed, on the same
+; |duty| axis as the traction half, so the whole map reads the same way.
+;   peak  = strength * lever ^ response
+;   speed = (1 - duty_dep) + duty_dep * duty ^ (1 + curve)
+;   cell  = -(peak * speed)
+; duty_dep 0.0 (the default) is flat: -10% lever is -10% current at any
+; speed. Raise it to fade braking out at low speed, or invert the feel
+; with the curve. How far back the lever may drive is NOT in these cells -
+; see brake-reverse in package.lisp.
+(defun brake-cell (b duty strength resp dep curve)
+    (let ((peak (* strength (pow b resp)))
+          (speed (clamp01 (+ (- 1.0 dep) (* dep (pow duty (+ 1.0 curve)))))))
+        (- (* peak speed))))
 
-(defun gen-brake-map (strength resp coupling width overrun curve)
+(defun gen-brake-map (strength resp dep curve)
     (looprange bi 0 10
         (let ((b (/ (- 10 bi) 10.0)))
             (looprange di 0 11
                 (map-set-cell bi di
-                    (to-fp (brake-cell b (/ di 10.0) strength resp coupling
-                                       width overrun curve)))))))
+                    (to-fp (brake-cell b (/ di 10.0) strength resp dep curve)))))))
 @const-end
