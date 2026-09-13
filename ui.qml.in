@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 6
+    property int buildMarker: 7
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -64,16 +64,27 @@ Item {
     // 10% steps: 21x21 would not fit the EEPROM once the brake half was
     // added, and bilinear interpolation smooths duty anyway.
     readonly property int mapThrN: 31
-    readonly property int mapDutyN: 11
+    readonly property int mapDutyN: 21   // brake rows; traction rows store 11
     readonly property int mapThrZero: 10
-    readonly property int mapCells: 341
+    readonly property int mapCells: 441
 
     // Signed throttle a row stands for, and its label.
     function rowThrottle(t) {
         return t < mapThrZero ? (t - mapThrZero) / 10.0 : (t - mapThrZero) / 20.0
     }
     function rowPct(t) { return Math.round(rowThrottle(t) * 100) }
-    function dutyPct(d) { return d * 10 }
+    // Ragged on purpose: negative duty under a positive throttle always
+    // means "full forward torque", so those cells are not stored at all and
+    // the space goes to the traction half's 5% throttle steps instead.
+    function mapRowCols(t) { return t < mapThrZero ? 21 : 11 }
+    // Signed duty a column stands for, -1..1
+    function colDuty(t, d) { return t < mapThrZero ? (d - 10) / 10.0 : d / 10.0 }
+    function dutyPct(t, d) { return Math.round(colDuty(t, d) * 100) }
+    // Nearest stored column of a row to a signed duty
+    function colOf(t, duty) {
+        var c = t < mapThrZero ? Math.round(duty * 10) + 10 : Math.round(duty * 10)
+        return Math.max(0, Math.min(mapRowCols(t) - 1, c))
+    }
     // Fractional row position of a signed throttle - the inverse of
     // rowThrottle, and the same two-slope axis map-lookup uses.
     function rowPosOf(thr) {
@@ -85,10 +96,11 @@ Item {
     // Signed throttle actually in effect right now, for the live dot.
     function liveSigned() { return liveBrake > 0 ? -liveBrake : liveThrottle }
     // One axis for the whole map: absolute duty, brake rows included.
-    function liveDutyAxis() { return Math.abs(liveDuty) }
+    // Shared horizontal axis for drawing: -100%..+100% duty, 0..1
+    function dutyToX(duty) { return (Math.max(-1, Math.min(1, duty)) + 1) / 2 }
 
     // ---------------------------------------------------------------
-    // Map data model: flat JS array, row-major [thrIdx*mapDutyN + dutyIdx]
+    // Map data model: flat JS array, ragged - see cellIdx
     property var mapData: initMapData()
     property var selection: ({ active:false, t0:0, d0:0, t1:0, d1:0 })
     property int curRow: 20   // for row/col copy-paste + curve picker
@@ -127,10 +139,10 @@ Item {
     property real cfgBrakeResp: 1.0
     property real cfgBrakeDep: 0.0
     property int cfgBrakeCurve: 0
-    // Reverse limiter, fixed point (x1000) to match the control loop
-    property int cfgRevCoupling: 1000
-    property int cfgRevWidth: 100
-    property int cfgRevOverrun: 120
+    // Reverse shaping: generator parameters for the brake rows' left half
+    property real cfgRevCoupling: 1.0
+    property real cfgRevWidth: 0.10
+    property real cfgRevOverrun: 0.12
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
     property int thrInvert: 0
@@ -162,9 +174,9 @@ Item {
             if (c.brakeStr !== undefined) range(c.brakeStr,0,1,false)
             if (c.brakeResp !== undefined) range(c.brakeResp,0.3,2,false)
             if (c.brakeDep !== undefined) range(c.brakeDep,0,1,false)
-            if (c.revCoupling !== undefined) range(c.revCoupling,0,1500,true)
-            if (c.revWidth !== undefined) range(c.revWidth,20,300,true)
-            if (c.revOverrun !== undefined) range(c.revOverrun,0,500,true)
+            if (c.revCoupling !== undefined) range(c.revCoupling,0,1.5,false)
+            if (c.revWidth !== undefined) range(c.revWidth,0.02,0.3,false)
+            if (c.revOverrun !== undefined) range(c.revOverrun,0,0.5,false)
             if (c.brakeCurve !== undefined) range(c.brakeCurve,0,3,true)
         }
     }
@@ -187,7 +199,9 @@ Item {
         var x = Math.max(-1, Math.min(1, v)) * 100
         return (x < 0 ? Math.ceil(x) : Math.floor(x)) / 100
     }
-    function cellIdx(t, d) { return t * mapDutyN + d }
+    function cellIdx(t, d) {
+        return t < mapThrZero ? t * 21 + d : 210 + (t - mapThrZero) * 11 + d
+    }
     function getCell(t, d) { return mapData[cellIdx(t, d)] }
     function setCellLocal(t, d, v) {
         v = quantizeCell(v)
@@ -221,7 +235,8 @@ Item {
     }
     function sendSetMapRow(t) {
         var b = [cmdSetMapRow, t & 0xff]
-        for (var d = 0; d < mapDutyN; d++) b = b.concat(i16Bytes(fxEnc(getCell(t, d))))
+        for (var d = 0; d < 21; d++)
+            b = b.concat(i16Bytes(d < mapRowCols(t) ? fxEnc(getCell(t, d)) : 0))
         sendPacket(b)
     }
     function sendAllRows() { for (var t = 0; t < mapThrN; t++) sendSetMapRow(t) }
@@ -248,9 +263,9 @@ Item {
         b = b.concat(i16Bytes(fxEnc(cfgBrakeDep)))
         b.push(cfgBrakeCurve & 0xff)
         b.push(regenBrake === true ? 1 : 0)
-        b = b.concat(i16Bytes(cfgRevCoupling))
-        b = b.concat(i16Bytes(cfgRevWidth))
-        b = b.concat(i16Bytes(cfgRevOverrun))
+        b = b.concat(i16Bytes(fxEnc(cfgRevCoupling)))
+        b = b.concat(i16Bytes(fxEnc(cfgRevWidth)))
+        b = b.concat(i16Bytes(fxEnc(cfgRevOverrun)))
         sendPacket(b)
     }
     function sendSetThrottle() {
@@ -349,14 +364,14 @@ Item {
             liveBrake = fxDec(view.getInt16(13, false))
             statusText = "Connected"
         } else if (cmd === rxMapRow) {
-            if (view.byteLength !== 24) return
+            if (view.byteLength !== 44) return
             var row = view.getUint8(1)
             if (row >= mapThrN) return
             // A 31-bit mask would overflow a JS bitwise int, so count the
             // rows in a plain array instead.
             rowSeen[row] = true
             var arr = mapData.slice()
-            for (var d = 0; d < mapDutyN; d++)
+            for (var d = 0; d < mapRowCols(row); d++)
                 arr[cellIdx(row, d)] = fxDec(view.getInt16(2 + d * 2, false))
             mapData = arr
         } else if (cmd === rxStatus) {
@@ -410,9 +425,9 @@ Item {
             cfgBrakeResp = fxDec(view.getInt16(33, false))
             cfgBrakeDep = fxDec(view.getInt16(35, false))
             cfgBrakeCurve = view.getUint8(37)
-            cfgRevCoupling = view.getInt16(38, false)
-            cfgRevWidth = view.getInt16(40, false)
-            cfgRevOverrun = view.getInt16(42, false)
+            cfgRevCoupling = fxDec(view.getInt16(38, false))
+            cfgRevWidth = fxDec(view.getInt16(40, false))
+            cfgRevOverrun = fxDec(view.getInt16(42, false))
         }
     }
 
@@ -495,10 +510,28 @@ Item {
         for (var bi = 0; bi < mapThrZero; bi++) {
             var lever = (mapThrZero - bi) / 10.0
             var peak = cfgBrakeStr * Math.pow(lever, cfgBrakeResp)
-            for (var di = 0; di < mapDutyN; di++) {
-                var duty = di / (mapDutyN - 1)
-                var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
-                arr[cellIdx(bi, di)] = quantizeCell(-peak * Math.max(0, Math.min(1, speed)))
+            var balance = Math.max(0, Math.min(1, lever * cfgRevCoupling))
+            var start = Math.max(0, Math.min(1, balance - cfgRevWidth))
+            for (var di = 0; di < 21; di++) {
+                var duty = (di - 10) / 10.0
+                var val
+                if (duty > 0) {
+                    var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
+                    val = -peak * Math.max(0, Math.min(1, speed))
+                } else if (cfgRevCoupling === 0) {
+                    val = -peak
+                } else {
+                    var rev = -duty
+                    if (rev <= start) val = -peak
+                    else if (rev <= balance) {
+                        var pr = (rev - start) / Math.max(0.001, balance - start)
+                        val = -peak * (1 - shapeCurve(pr, 1))
+                    } else {
+                        var over = (rev - balance) / Math.max(0.001, 1 - balance)
+                        val = cfgRevOverrun * Math.pow(Math.max(0, Math.min(1, over)), 2)
+                    }
+                }
+                arr[cellIdx(bi, di)] = quantizeCell(val)
             }
         }
         mapData = arr
@@ -512,8 +545,8 @@ Item {
             var thr = ti / 20.0
             var peak = thermalPeak(thr, cfgTorqueResp, cfgHighHold)
             var balanceDuty = Math.max(0, Math.min(1, thr * cfgSpeedCoupling))
-            for (var di = 0; di < mapDutyN; di++) {
-                var duty = di / (mapDutyN - 1)
+            for (var di = 0; di < 11; di++) {
+                var duty = di / 10.0
                 var val
                 if (thr < 0.02) {
                     val = -cfgEngineBrake * Math.pow(duty, 1 + cfgRegenCurve)
@@ -723,20 +756,29 @@ Item {
                         anchors.margins: 24
                         property int rowBase: firstRow()
                         property int rowCount: mapThrN - rowBase
-                        property real cw: width / mapDutyN
+                        // One shared duty axis, -100%..+100%, so the two
+                        // halves line up cell for cell even though the
+                        // traction rows only store the right side of it.
+                        property real cw: width / 20
                         property real ch: height / rowCount
 
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.clearRect(0, 0, width, height)
                             try {
+                                // Region the traction rows do not store.
+                                if (rowBase < mapThrZero) {
+                                    ctx.fillStyle = "#16181c"
+                                    ctx.fillRect(0, 0, width / 2,
+                                                 height - (mapThrZero - rowBase) * ch)
+                                }
                                 for (var t = rowBase; t < mapThrN; t++) {
-                                    for (var d = 0; d < mapDutyN; d++) {
+                                    for (var d = 0; d < mapRowCols(t); d++) {
                                         var v = getCell(t, d)
                                         var col = valueColor(v)
                                         ctx.fillStyle = Qt.rgba(col.r, col.g, col.b, 1)
                                         var y = height - (t - rowBase + 1) * ch
-                                        var x = d * cw
+                                        var x = dutyToX(colDuty(t, d)) * width - cw / 2
                                         var selected = isSelected(t, d)
                                         ctx.fillRect(x, y, cw - 1, ch - 1)
                                         if (selected) {
@@ -768,11 +810,12 @@ Item {
                         Component.onCompleted: requestPaint()
 
                         function cellFromPos(mx, my) {
-                            var d = Math.floor(mx / cw)
                             var t = rowBase + Math.floor((height - my) / ch)
-                            d = Math.max(0, Math.min(mapDutyN-1, d))
                             t = Math.max(rowBase, Math.min(mapThrN-1, t))
-                            return { t: t, d: d }
+                            // Back out the duty this x stands for, then snap
+                            // to whichever column that row actually stores.
+                            var duty = (mx / width) * 2 - 1
+                            return { t: t, d: colOf(t, duty) }
                         }
                     }
 
@@ -785,7 +828,7 @@ Item {
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.clearRect(0, 0, width, height)
-                            var lx = liveDutyAxis() * width
+                            var lx = dutyToX(liveDuty) * width
                             // Centre of the band the live throttle sits in,
                             // so the dot lines up with the cell it reads.
                             var ly = height - (rowPosOf(liveSigned()) - heatmap.rowBase + 0.5) * heatmap.ch
@@ -823,8 +866,9 @@ Item {
                     }
 
                     // axis labels
-                    Label { text: cfgBrakeMap === 1 ? "Brake -100%" : "Throttle 0%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
-                    Label { text: "Duty 100%"; color: "#888"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: cfgBrakeMap === 1 ? "Brake -100%  /  Duty -100%" : "Throttle 0%  /  Duty -100%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: "Duty 0%"; color: "#666"; anchors.horizontalCenter: parent.horizontalCenter; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: "Duty +100%"; color: "#888"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Throttle +100%"; color: "#888"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
                 }
 
@@ -1042,7 +1086,7 @@ Item {
 
                         Label { text: "Brake curve (negative rows)"; font.bold: true; color: "#ddd" }
                         Label {
-                            text: "Shapes how hard the lever brakes at each speed, on the same duty axis as the traction half. Default is flat: -10% lever is -10% current at any speed. How far back the lever may drive is separate, in Reverse limit on the Config tab."
+                            text: "The right half of these rows is braking against forward speed - flat by default, so -10% lever is -10% current at any speed. The left half is reverse, below."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         Flow {
@@ -1057,6 +1101,8 @@ Item {
                                 onClicked: {
                                     cfgBrakeStr = 1.0; cfgBrakeResp = 1.0
                                     cfgBrakeDep = 0.0; cfgBrakeCurve = 0
+                                    cfgRevCoupling = 1.0; cfgRevWidth = 0.10
+                                    cfgRevOverrun = 0.12
                                     brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true)
                                 }
                             }
@@ -1121,6 +1167,95 @@ Item {
                             text: "0.00 (default) brakes the same at every speed. Raise it to fade braking out towards a standstill, which keeps regen from grabbing at walking pace."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
+                        // Left half of the brake rows: the reverse region.
+                        ColumnLayout {
+                            visible: true
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+                        Label { text: "Reverse (left half of the brake rows)"; font.bold: true; color: "#ddd" }
+                        Label {
+                            text: "Only a bidirectional brake ever reaches these columns - the other two types never travel backwards under power, so shaping reverse costs them nothing."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Reverse speed coupling"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgRevCoupling.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.5)
+                                        if (v !== null) { cfgRevCoupling = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgRevCoupling.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider {
+                                Layout.fillWidth: true; from: 0.0; to: 1.5
+                                value: cfgRevCoupling
+                                onMoved: cfgRevCoupling = value
+                                onPressedChanged: if (!pressed) requestBrakeRegen()
+                            }
+                        }
+                        Label {
+                            text: "The reverse duty each lever position settles at: 1.00 means 10% lever backs up to 10% duty and then stops pulling. Lower is shorter-geared in reverse; 0.00 removes the limit and it keeps accelerating backwards."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Transition width"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgRevWidth.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.02, 0.30)
+                                        if (v !== null) { cfgRevWidth = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgRevWidth.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider {
+                                Layout.fillWidth: true; from: 0.02; to: 0.30
+                                value: cfgRevWidth
+                                onMoved: cfgRevWidth = value
+                                onPressedChanged: if (!pressed) requestBrakeRegen()
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Runaway hold"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgRevOverrun.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 0.50)
+                                        if (v !== null) { cfgRevOverrun = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgRevOverrun.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider {
+                                Layout.fillWidth: true; from: 0.0; to: 0.50
+                                value: cfgRevOverrun
+                                onMoved: cfgRevOverrun = value
+                                onPressedChanged: if (!pressed) requestBrakeRegen()
+                            }
+                        }
+                        Label {
+                            text: "Forward torque applied past the balance point, to pull a reverse that is running away downhill back down to it."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                    }
+
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
                             Label { text: "Speed curve"; color: "#ccc" }
@@ -1174,7 +1309,7 @@ Item {
                         color: "#fff"
                         text: hoverT >= 0
                             ? (hoverT < mapThrZero ? "Brake " : "Thr ") + Math.abs(rowPct(hoverT)) + "%  Duty "
-                              + dutyPct(hoverD) + "%\nValue " + getCell(hoverT, hoverD).toFixed(2)
+                              + dutyPct(hoverT, hoverD) + "% duty\nValue " + getCell(hoverT, hoverD).toFixed(2)
                             : "Click a cell to edit"
                     }
                     RowLayout {
@@ -1230,8 +1365,8 @@ Item {
                     }
                     RowLayout {
                         Label { text: "Col (duty)"; color: "#aaa" }
-                        SpinBox { id: colSpin; from: 0; to: mapDutyN-1; editable: true; value: 5 }
-                        Label { text: dutyPct(colSpin.value) + " % duty"; color: "#aaa" }
+                        SpinBox { id: colSpin; from: 0; to: mapRowCols(curRow)-1; editable: true; value: 5 }
+                        Label { text: dutyPct(curRow, colSpin.value) + " % duty (row " + curRow + ")"; color: "#aaa" }
                     }
                     Flow {
                         Layout.fillWidth: true
@@ -1251,8 +1386,14 @@ Item {
                 var dmin = Math.min(selection.d0, selection.d1), dmax = Math.max(selection.d0, selection.d1)
                 return t >= tmin && t <= tmax && d >= dmin && d <= dmax
             }
-            function mapRowSlice(t) { var r = []; for (var d = 0; d < mapDutyN; d++) r.push(getCell(t,d)); return r }
-            function mapColSlice(d) { var r = []; for (var t = 0; t < mapThrN; t++) r.push(getCell(t,d)); return r }
+            function mapRowSlice(t) { var r = []; for (var d = 0; d < mapRowCols(t); d++) r.push(getCell(t,d)); return r }
+            // Only meaningful within one half; the two do not share columns.
+            function mapColSlice(d) {
+                var r = [], t0 = curRow < mapThrZero ? 0 : mapThrZero
+                var t1 = curRow < mapThrZero ? mapThrZero : mapThrN
+                for (var t = t0; t < t1; t++) r.push(getCell(t, Math.min(d, mapRowCols(t)-1)))
+                return r
+            }
             // These used to call setCellLocal per cell, each doing its own
             // full 441-element array copy + mapData reassignment (so a
             // 441-cell selection did up to ~194,000 element copies, and
@@ -1262,7 +1403,7 @@ Item {
             function bumpRow(t, delta) {
                 cfgPreset = 0
                 var arr = mapData.slice()
-                for (var d = 0; d < mapDutyN; d++) {
+                for (var d = 0; d < mapRowCols(t); d++) {
                     var v = Math.max(-1, Math.min(1, getCell(t,d) + delta))
                     arr[cellIdx(t, d)] = v
                 }
@@ -1273,9 +1414,9 @@ Item {
                 cfgPreset = 0
                 var row = mapRowSlice(t)
                 var out = row.slice()
-                for (var d = 1; d < mapDutyN-1; d++) out[d] = (row[d-1] + row[d]*2 + row[d+1]) / 4
+                for (var d = 1; d < mapRowCols(t)-1; d++) out[d] = (row[d-1] + row[d]*2 + row[d+1]) / 4
                 var arr = mapData.slice()
-                for (var d2 = 0; d2 < mapDutyN; d2++) arr[cellIdx(t, d2)] = Math.max(-1, Math.min(1, out[d2]))
+                for (var d2 = 0; d2 < mapRowCols(t); d2++) arr[cellIdx(t, d2)] = Math.max(-1, Math.min(1, out[d2]))
                 mapData = arr
                 sendSetMapRow(t)
             }
@@ -1283,7 +1424,8 @@ Item {
                 cfgPreset = 0
                 if (!clipboardRow) return
                 var arr = mapData.slice()
-                for (var d = 0; d < mapDutyN; d++) arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardRow[d]))
+                for (var d = 0; d < Math.min(mapRowCols(t), clipboardRow.length); d++)
+                    arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardRow[d]))
                 mapData = arr
                 sendSetMapRow(t)
             }
@@ -1291,9 +1433,12 @@ Item {
                 cfgPreset = 0
                 if (!clipboardCol) return
                 var arr = mapData.slice()
-                for (var t = 0; t < mapThrN; t++) arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardCol[t]))
+                var t0 = curRow < mapThrZero ? 0 : mapThrZero
+                var t1 = curRow < mapThrZero ? mapThrZero : mapThrN
+                for (var t = t0; t < t1 && t - t0 < clipboardCol.length; t++)
+                    if (d < mapRowCols(t)) arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardCol[t - t0]))
                 mapData = arr
-                for (var t2 = 0; t2 < mapThrN; t2++) sendSetMapRow(t2)
+                for (var t2 = t0; t2 < t1; t2++) sendSetMapRow(t2)
             }
             function interpolateSelection() {
                 cfgPreset = 0
@@ -1305,7 +1450,7 @@ Item {
                 var rows = {}
                 for (var t = tmin; t <= tmax; t++) {
                     var ft = tmax > tmin ? (t - tmin) / (tmax - tmin) : 0
-                    for (var d = dmin; d <= dmax; d++) {
+                    for (var d = dmin; d <= dmax && d < mapRowCols(t); d++) {
                         var fd = dmax > dmin ? (d - dmin) / (dmax - dmin) : 0
                         var f = (ft + fd) / (tmax > tmin || dmax > dmin ? (tmax>tmin && dmax>dmin ? 2 : 1) : 1)
                         arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, v0 + (v1 - v0) * f))
@@ -1363,8 +1508,8 @@ Item {
                                 function plotRow(t, color, widthPx) {
                                     ctx.strokeStyle = color; ctx.lineWidth = widthPx
                                     ctx.beginPath()
-                                    for (var d = 0; d < mapDutyN; d++) {
-                                        var x = d / (mapDutyN-1) * width
+                                    for (var d = 0; d < mapRowCols(t); d++) {
+                                        var x = dutyToX(colDuty(t, d)) * width
                                         var v = getCell(t, d)
                                         var y = height/2 - v * (height/2)
                                         if (d === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
@@ -1400,7 +1545,7 @@ Item {
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.clearRect(0, 0, width, height)
-                            var lx2 = liveDutyAxis() * width
+                            var lx2 = dutyToX(liveDuty) * width
                             var ly = height/2 - liveCurRel * (height/2)
                             ctx.beginPath(); ctx.arc(lx2, ly, 5, 0, 2*Math.PI)
                             ctx.fillStyle = "#00e5ff"; ctx.fill()
@@ -1413,7 +1558,7 @@ Item {
                     }
                     Label { text: "-1.0"; color: "#777"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "+1.0"; color: "#777"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
-                    Label { text: "Duty 0% → 100%"; color: "#777"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: "Duty -100% → +100%"; color: "#777"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
                 }
 
                 Flickable {
@@ -1490,16 +1635,17 @@ Item {
                     // canvas, which is why this tab looked "empty" before
                     // the sizing chain was fixed.
                     property int rowBase: firstRow()
-                    property real tileW: Math.max(4, 0.5 * width / (mapDutyN - 1))
+                    property real tileW: Math.max(4, 0.5 * width / 20)
                     // Depth axis is scaled separately now that it has up
                     // to 31 rows against the duty axis' 11.
                     property real tileH: Math.max(3, 0.5 * height / (mapThrN - 1))
                     property real zScale: Math.max(20, height * 0.25)
 
+                    // d is a shared column coordinate 0..20 (duty -100..+100)
                     function project(t, d, v) {
                         var rad = iso3DTab.rotDeg * Math.PI / 180
                         var ct = (rowBase + mapThrN - 1) / 2
-                        var cd = (mapDutyN - 1) / 2
+                        var cd = 10
                         var rt = t - ct, rd = d - cd
                         var cosr = Math.cos(rad), sinr = Math.sin(rad)
                         var pt = rt * cosr - rd * sinr
@@ -1517,17 +1663,21 @@ Item {
                         try {
                             // painter's algorithm: back-to-front by (t+d),
                             // a decent approximation regardless of rotDeg
-                            for (var s = 0; s <= (mapThrN-1) + (mapDutyN-1); s++) {
-                                for (var t = rowBase; t < mapThrN; t++) {
+                            // Quads only within a half: the two do not share
+                            // a column layout, so nothing spans the seam.
+                            for (var s = 0; s <= (mapThrN-1) + 20; s++) {
+                                for (var t = rowBase; t < mapThrN - 1; t++) {
+                                    if (t + 1 === mapThrZero) continue
+                                    var cols = mapRowCols(t)
                                     var d = s - t
-                                    if (d < 0 || d >= mapDutyN) continue
-                                    if (t+1 >= mapThrN || d+1 >= mapDutyN) continue
+                                    if (d < 0 || d + 1 >= cols) continue
+                                    var g0 = t < mapThrZero ? d : d + 10
                                     var v00 = getCell(t, d), v10 = getCell(t+1, d)
                                     var v01 = getCell(t, d+1), v11 = getCell(t+1, d+1)
-                                    var p00 = project(t, d, v00)
-                                    var p10 = project(t+1, d, v10)
-                                    var p01 = project(t, d+1, v01)
-                                    var p11 = project(t+1, d+1, v11)
+                                    var p00 = project(t, g0, v00)
+                                    var p10 = project(t+1, g0, v10)
+                                    var p01 = project(t, g0+1, v01)
+                                    var p11 = project(t+1, g0+1, v11)
                                     var avg = (v00+v10+v01+v11)/4
                                     var col = valueColor(avg)
                                     ctx.fillStyle = Qt.rgba(col.r, col.g, col.b, 1)
@@ -1567,7 +1717,7 @@ Item {
                         var ctx = getContext("2d")
                         ctx.clearRect(0, 0, width, height)
                         var ti = rowPosOf(liveSigned())
-                        var di = liveDutyAxis() * (mapDutyN-1)
+                        var di = (Math.max(-1, Math.min(1, liveDuty)) + 1) * 10
                         var lp = isoCanvas.project(ti, di, liveCurRel)
                         ctx.beginPath(); ctx.arc(lp.x, lp.y, 5, 0, 2*Math.PI)
                         ctx.fillStyle = "#00e5ff"; ctx.fill()
@@ -1585,7 +1735,7 @@ Item {
                 }
 
                 Label {
-                    text: "Pseudo-3D (isometric Canvas). X = Duty, depth = Throttle, height/color = Current Rel."
+                    text: "Pseudo-3D (isometric Canvas). X = Duty -100..+100, depth = Throttle, height/color = Current Rel."
                     color: "#777"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 6
                     wrapMode: Text.WordWrap
                 }
@@ -1764,99 +1914,6 @@ Item {
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
-                    // Deliberately NOT in the map. The brake cells shape
-                    // braking against forward speed, which is what riding
-                    // uses; how far back the lever may drive is a separate
-                    // low-speed manoeuvre and gets its own three numbers,
-                    // applied on top of the cells only while actually
-                    // travelling backwards.
-                    ColumnLayout {
-                        visible: cfgBrakeType === 2
-                        Layout.fillWidth: true
-                        spacing: 10
-
-                        Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
-                        Label { text: "Reverse limit"; font.bold: true; color: "#ddd" }
-                        Label {
-                            text: "Applies only while genuinely rolling backwards, so it never costs you braking on the way there. Independent of the brake map."
-                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
-                        }
-
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Reverse speed coupling"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: (cfgRevCoupling / 1000).toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0.0, 1.5)
-                                        if (v !== null) { cfgRevCoupling = Math.round(v * 1000); sendSetConfig(false) }
-                                        text = Qt.binding(function() { return (cfgRevCoupling / 1000).toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider {
-                                Layout.fillWidth: true; from: 0; to: 1500; stepSize: 10
-                                value: cfgRevCoupling
-                                onMoved: cfgRevCoupling = Math.round(value)
-                                onPressedChanged: if (!pressed) sendSetConfig(false)
-                            }
-                        }
-                        Label {
-                            text: "The reverse duty each lever position settles at: 1.00 means 10% lever backs up to 10% duty and then stops pulling. Lower is shorter-geared in reverse; 0.00 removes the limit and it keeps accelerating backwards."
-                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
-                        }
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Transition width"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: (cfgRevWidth / 1000).toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0.02, 0.30)
-                                        if (v !== null) { cfgRevWidth = Math.round(v * 1000); sendSetConfig(false) }
-                                        text = Qt.binding(function() { return (cfgRevWidth / 1000).toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider {
-                                Layout.fillWidth: true; from: 20; to: 300; stepSize: 5
-                                value: cfgRevWidth
-                                onMoved: cfgRevWidth = Math.round(value)
-                                onPressedChanged: if (!pressed) sendSetConfig(false)
-                            }
-                        }
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Runaway hold"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: (cfgRevOverrun / 1000).toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0.0, 0.50)
-                                        if (v !== null) { cfgRevOverrun = Math.round(v * 1000); sendSetConfig(false) }
-                                        text = Qt.binding(function() { return (cfgRevOverrun / 1000).toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider {
-                                Layout.fillWidth: true; from: 0; to: 500; stepSize: 5
-                                value: cfgRevOverrun
-                                onMoved: cfgRevOverrun = Math.round(value)
-                                onPressedChanged: if (!pressed) sendSetConfig(false)
-                            }
-                        }
-                        Label {
-                            text: "Forward torque applied past the balance point, to pull a reverse that is running away downhill back down to it."
-                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
-                        }
-                    }
 
                     // No ADC/PPM/UART hardware wired up yet? Pick "Test
                     // (bench, via USB)" above, then drag this - it drives
@@ -2032,9 +2089,9 @@ Item {
                                         cfgBrakeStr = obj.cfg.brakeStr === undefined ? 1.0 : obj.cfg.brakeStr
                                         cfgBrakeResp = obj.cfg.brakeResp === undefined ? 1.0 : obj.cfg.brakeResp
                                         cfgBrakeDep = obj.cfg.brakeDep === undefined ? 0.0 : obj.cfg.brakeDep
-                                        cfgRevCoupling = obj.cfg.revCoupling === undefined ? 1000 : obj.cfg.revCoupling
-                                        cfgRevWidth = obj.cfg.revWidth === undefined ? 100 : obj.cfg.revWidth
-                                        cfgRevOverrun = obj.cfg.revOverrun === undefined ? 120 : obj.cfg.revOverrun
+                                        cfgRevCoupling = obj.cfg.revCoupling === undefined ? 1.0 : obj.cfg.revCoupling
+                                        cfgRevWidth = obj.cfg.revWidth === undefined ? 0.10 : obj.cfg.revWidth
+                                        cfgRevOverrun = obj.cfg.revOverrun === undefined ? 0.12 : obj.cfg.revOverrun
                                         cfgBrakeCurve = obj.cfg.brakeCurve === undefined ? 0 : obj.cfg.brakeCurve
                                     }
                                     regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()

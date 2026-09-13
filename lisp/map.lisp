@@ -1,30 +1,60 @@
 ; Signed-byte cells stay in RAM; code and immutable constants live in flash.
-; Vertical axis spans -100%..+100% throttle: rows 0..9 are the brake half
-; (10% steps), row 10 is zero, rows 10..30 are traction (5% steps).
+;
+; The grid is deliberately ragged, because a rectangular one would spend a
+; quarter of the EEPROM on a region with no content: negative duty under a
+; positive throttle only ever means "full forward torque".
+;
+;   rows 0..9   brake levers -100%..-10%, 10% steps, 21 duty columns
+;               spanning -100%..+100% - braking against speed on the right,
+;               reverse on the left
+;   rows 10..30 throttle 0..100%, 5% steps, 11 duty columns spanning
+;               0..100%; negative duty reads as column 0
+;
+; 10*21 + 21*11 = 441 cells, the same budget a 21x21 grid would have used.
 @const-start
 (define map-thr-n 31)
-(define map-duty-n 11)
+(define map-duty-n 21)
 (define map-thr-zero 10)
-(define map-cells 341)
+(define map-brake-cells 210)
+(define map-cells 441)
 @const-end
 (define map-buf (array-create map-cells))
 @const-start
-(defun map-idx (t-i d-i) (+ (* t-i 11) d-i))
+; Columns a given row actually stores.
+(defun map-row-cols (t-i) (if (< t-i 10) 21 11))
+(defun map-idx (t-i d-i)
+    (if (< t-i 10)
+        (+ (* t-i 21) d-i)
+        (+ 210 (* (- t-i 10) 11) d-i)))
 (defun map-get-cell (t-i d-i) (* (bufget-i8 map-buf (map-idx t-i d-i)) 10))
 (defun map-set-cell (t-i d-i val)
     (bufset-i8 map-buf (map-idx t-i d-i) (cell-to-i8 val)))
 
-; Row position of a signed throttle, x1000. The two halves have different
-; steps, so the scale depends on the sign; the +10000 bias keeps the value
-; positive so `mod` behaves. All intermediates fit a 28-bit inline integer.
-(defun map-row-pos (thr)
-    (let ((tc (clamp-f thr -1000 1000)))
-        (+ 10000 (* tc (if (< tc 0) 10 20)))))
+; Zero lever is not stored: it is zero by definition, and having it lets a
+; light pull fade in from nothing instead of jumping to the -10% row.
+(defun map-brake-get (p d-i) (if (= p 0) 0 (map-get-cell (- 10 p) d-i)))
 
-(defun map-lookup (thr duty)
-    (let ((tf (map-row-pos thr))
+; ---- lookup --------------------------------------------------------------
+; Both halves interpolate on their own uniform grid; nothing ever needs to
+; blend across the seam, since throttle and brake are separate inputs.
+; All intermediates fit the VESC's signed 28-bit inline integer.
+
+(defun map-lookup-brake (lev duty)
+    (let ((lf (* (clamp-f lev 0 1000) 10))
+          (df (* (+ (clamp-f duty -1000 1000) 1000) 10))
+          (p0 (min-f (/ lf 1000) 10)) (d0 (min-f (/ df 1000) 20))
+          (p1 (min-f (+ p0 1) 10)) (d1 (min-f (+ d0 1) 20))
+          (pw (mod lf 1000)) (dw (mod df 1000))
+          (v00 (map-brake-get p0 d0)) (v01 (map-brake-get p0 d1))
+          (v10 (map-brake-get p1 d0)) (v11 (map-brake-get p1 d1))
+          (v0 (+ v00 (/ (* (- v01 v00) dw) 1000)))
+          (v1 (+ v10 (/ (* (- v11 v10) dw) 1000))))
+        (+ v0 (/ (* (- v1 v0) pw) 1000))))
+
+(defun map-lookup-drive (thr duty)
+    (let ((tf (* (clamp-f thr 0 1000) 20))
           (df (* (clamp-f duty 0 1000) 10))
-          (t0 (min-f (/ tf 1000) 30)) (d0 (/ df 1000))
+          (t0 (min-f (+ 10 (/ tf 1000)) 30)) (d0 (min-f (/ df 1000) 10))
           (t1 (min-f (+ t0 1) 30)) (d1 (min-f (+ d0 1) 10))
           (tw (mod tf 1000)) (dw (mod df 1000))
           (v00 (map-get-cell t0 d0)) (v01 (map-get-cell t0 d1))
@@ -32,6 +62,13 @@
           (v0 (+ v00 (/ (* (- v01 v00) dw) 1000)))
           (v1 (+ v10 (/ (* (- v11 v10) dw) 1000))))
         (+ v0 (/ (* (- v1 v0) tw) 1000))))
+
+(defun map-lookup (thr duty)
+    (if (< thr 0)
+        (map-lookup-brake (- thr) duty)
+        (map-lookup-drive thr duty)))
+
+; ---- generators ----------------------------------------------------------
 
 (defun thermal-peak (thr response hold)
     (let ((base (pow thr response)))
@@ -59,8 +96,6 @@
                         (clamp01 (/ (- duty balance) (max-f 0.001 (- 1.0 balance))))
                         (+ 1.0 curve))))))))))
 
-; Traction half only: the brake rows are hand territory and no slider ever
-; rewrites them.
 (defun gen-thermal-map (response coupling width shape hold brake overrun curve)
     (looprange ti 0 21
         (let ((thr (/ ti 20.0))
@@ -71,24 +106,36 @@
                     (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
                                         width shape brake overrun curve)))))))
 
-; Brake half generator: braking demand against FORWARD speed, on the same
-; |duty| axis as the traction half, so the whole map reads the same way.
-;   peak  = strength * lever ^ response
-;   speed = (1 - duty_dep) + duty_dep * duty ^ (1 + curve)
-;   cell  = -(peak * speed)
-; duty_dep 0.0 (the default) is flat: -10% lever is -10% current at any
-; speed. Raise it to fade braking out at low speed, or invert the feel
-; with the curve. How far back the lever may drive is NOT in these cells -
-; see brake-reverse in package.lisp.
-(defun brake-cell (b duty strength resp dep curve)
-    (let ((peak (* strength (pow b resp)))
-          (speed (clamp01 (+ (- 1.0 dep) (* dep (pow duty (+ 1.0 curve)))))))
-        (- (* peak speed))))
+; Brake rows. Forward duty carries braking against speed; negative duty
+; carries reverse, with the traction law's shape mirrored onto it.
+;   peak    = strength * lever ^ response
+;   forward : -(peak * ((1 - dep) + dep * duty ^ (1 + curve)))
+;   reverse : balance = clamp(lever * rev_coupling); below it -peak,
+;             tapering to zero at balance, then positive - forward torque,
+;             which holds a reverse that is running away.
+(defun brake-cell (b duty strength resp dep curve rcoup rwidth rover)
+    (let ((peak (* strength (pow b resp))))
+        (if (> duty 0.0)
+            (- (* peak (clamp01 (+ (- 1.0 dep) (* dep (pow duty (+ 1.0 curve)))))))
+            (if (= rcoup 0.0)
+                (- peak)
+                (let ((rev (- duty))
+                      (balance (clamp01 (* b rcoup))))
+                    (let ((start (clamp01 (- balance rwidth))))
+                        (cond
+                            ((<= rev start) (- peak))
+                            ((<= rev balance)
+                                (- (* peak (- 1.0 (shape-curve
+                                    (/ (- rev start) (max-f 0.001 (- balance start))) 1)))))
+                            (t (* rover (pow
+                                (clamp01 (/ (- rev balance) (max-f 0.001 (- 1.0 balance))))
+                                2.0))))))))))
 
-(defun gen-brake-map (strength resp dep curve)
+(defun gen-brake-map (strength resp dep curve rcoup rwidth rover)
     (looprange bi 0 10
         (let ((b (/ (- 10 bi) 10.0)))
-            (looprange di 0 11
+            (looprange di 0 21
                 (map-set-cell bi di
-                    (to-fp (brake-cell b (/ di 10.0) strength resp dep curve)))))))
+                    (to-fp (brake-cell b (/ (- di 10) 10.0)
+                                       strength resp dep curve rcoup rwidth rover)))))))
 @const-end
