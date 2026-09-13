@@ -47,7 +47,7 @@ Independent of the map, and applied to the brake lever only:
 | Value | Behaviour |
 | --- | --- |
 | 0 | Regen only: `set-brake-rel` throughout, no torque against travel |
-| 1 | Current, no reverse: regen while rolling, negative current below the ERPM threshold, regen again if it ever rolls backwards |
+| 1 | Current, no reverse: regen while rolling, negative current below the ERPM threshold, then latched back to regen as soon as it stops (below 50 ERPM) until the lever is released. Without that latch the torque reverses the motor, regen catches it, the speed re-enters the torque band and it shunts backwards repeatedly |
 | 2 | Current, bidirectional: as above, and it drives on into reverse once stopped |
 
 Engine braking and overrun regen, which come from the map itself rather
