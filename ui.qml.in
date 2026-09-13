@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 7
+    property int buildMarker: 8
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -73,17 +73,25 @@ Item {
         return t < mapThrZero ? (t - mapThrZero) / 10.0 : (t - mapThrZero) / 20.0
     }
     function rowPct(t) { return Math.round(rowThrottle(t) * 100) }
-    // Ragged on purpose: negative duty under a positive throttle always
-    // means "full forward torque", so those cells are not stored at all and
-    // the space goes to the traction half's 5% throttle steps instead.
+    // Ragged on purpose: for traction, duty is speed and its sign carries
+    // no extra information, so the negative side is the positive side
+    // mirrored and is not stored. The space pays for the traction half's
+    // 5% throttle steps instead.
     function mapRowCols(t) { return t < mapThrZero ? 21 : 11 }
-    // Signed duty a column stands for, -1..1
+    // Every view draws 21 display columns per row, duty -100%..+100%.
+    // dispCol says which stored cell one of them reads.
+    function dispCol(t, g) { return t < mapThrZero ? g : Math.abs(g - 10) }
+    function dispDuty(g) { return (g - 10) / 10.0 }
+    // Signed duty a STORED column stands for
     function colDuty(t, d) { return t < mapThrZero ? (d - 10) / 10.0 : d / 10.0 }
-    function dutyPct(t, d) { return Math.round(colDuty(t, d) * 100) }
+    function dutyPct(t, d) {
+        var v = Math.round(colDuty(t, d) * 100)
+        return t < mapThrZero ? v + "%" : (v === 0 ? "0%" : "±" + v + "%")
+    }
     // Nearest stored column of a row to a signed duty
     function colOf(t, duty) {
-        var c = t < mapThrZero ? Math.round(duty * 10) + 10 : Math.round(duty * 10)
-        return Math.max(0, Math.min(mapRowCols(t) - 1, c))
+        var g = Math.max(0, Math.min(20, Math.round(duty * 10) + 10))
+        return dispCol(t, g)
     }
     // Fractional row position of a signed throttle - the inverse of
     // rowThrottle, and the same two-slope axis map-lookup uses.
@@ -766,19 +774,14 @@ Item {
                             var ctx = getContext("2d")
                             ctx.clearRect(0, 0, width, height)
                             try {
-                                // Region the traction rows do not store.
-                                if (rowBase < mapThrZero) {
-                                    ctx.fillStyle = "#16181c"
-                                    ctx.fillRect(0, 0, width / 2,
-                                                 height - (mapThrZero - rowBase) * ch)
-                                }
                                 for (var t = rowBase; t < mapThrN; t++) {
-                                    for (var d = 0; d < mapRowCols(t); d++) {
+                                    for (var g = 0; g < 21; g++) {
+                                        var d = dispCol(t, g)
                                         var v = getCell(t, d)
                                         var col = valueColor(v)
                                         ctx.fillStyle = Qt.rgba(col.r, col.g, col.b, 1)
                                         var y = height - (t - rowBase + 1) * ch
-                                        var x = dutyToX(colDuty(t, d)) * width - cw / 2
+                                        var x = (g / 20) * width - cw / 2
                                         var selected = isSelected(t, d)
                                         ctx.fillRect(x, y, cw - 1, ch - 1)
                                         if (selected) {
@@ -812,10 +815,11 @@ Item {
                         function cellFromPos(mx, my) {
                             var t = rowBase + Math.floor((height - my) / ch)
                             t = Math.max(rowBase, Math.min(mapThrN-1, t))
-                            // Back out the duty this x stands for, then snap
-                            // to whichever column that row actually stores.
-                            var duty = (mx / width) * 2 - 1
-                            return { t: t, d: colOf(t, duty) }
+                            // Snap to a display column, then to the cell it
+                            // reads - on a traction row both mirrored halves
+                            // are the same cell.
+                            var g = Math.max(0, Math.min(20, Math.round(mx / width * 20)))
+                            return { t: t, d: dispCol(t, g) }
                         }
                     }
 
@@ -867,6 +871,11 @@ Item {
 
                     // axis labels
                     Label { text: cfgBrakeMap === 1 ? "Brake -100%  /  Duty -100%" : "Throttle 0%  /  Duty -100%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label {
+                        text: "Traction rows are mirrored about duty 0 - the two halves are the same cells"
+                        color: "#555"; font.pixelSize: 15
+                        anchors.horizontalCenter: parent.horizontalCenter; anchors.top: parent.top; anchors.margins: 4
+                    }
                     Label { text: "Duty 0%"; color: "#666"; anchors.horizontalCenter: parent.horizontalCenter; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Duty +100%"; color: "#888"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Throttle +100%"; color: "#888"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
@@ -1309,7 +1318,7 @@ Item {
                         color: "#fff"
                         text: hoverT >= 0
                             ? (hoverT < mapThrZero ? "Brake " : "Thr ") + Math.abs(rowPct(hoverT)) + "%  Duty "
-                              + dutyPct(hoverT, hoverD) + "% duty\nValue " + getCell(hoverT, hoverD).toFixed(2)
+                              + dutyPct(hoverT, hoverD) + " duty\nValue " + getCell(hoverT, hoverD).toFixed(2)
                             : "Click a cell to edit"
                     }
                     RowLayout {
@@ -1366,7 +1375,7 @@ Item {
                     RowLayout {
                         Label { text: "Col (duty)"; color: "#aaa" }
                         SpinBox { id: colSpin; from: 0; to: mapRowCols(curRow)-1; editable: true; value: 5 }
-                        Label { text: dutyPct(curRow, colSpin.value) + " % duty (row " + curRow + ")"; color: "#aaa" }
+                        Label { text: dutyPct(curRow, colSpin.value) + " duty (row " + curRow + ")"; color: "#aaa" }
                     }
                     Flow {
                         Layout.fillWidth: true
@@ -1508,8 +1517,9 @@ Item {
                                 function plotRow(t, color, widthPx) {
                                     ctx.strokeStyle = color; ctx.lineWidth = widthPx
                                     ctx.beginPath()
-                                    for (var d = 0; d < mapRowCols(t); d++) {
-                                        var x = dutyToX(colDuty(t, d)) * width
+                                    for (var g = 0; g < 21; g++) {
+                                        var d = dispCol(t, g)
+                                        var x = (g / 20) * width
                                         var v = getCell(t, d)
                                         var y = height/2 - v * (height/2)
                                         if (d === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
@@ -1668,12 +1678,11 @@ Item {
                             for (var s = 0; s <= (mapThrN-1) + 20; s++) {
                                 for (var t = rowBase; t < mapThrN - 1; t++) {
                                     if (t + 1 === mapThrZero) continue
-                                    var cols = mapRowCols(t)
-                                    var d = s - t
-                                    if (d < 0 || d + 1 >= cols) continue
-                                    var g0 = t < mapThrZero ? d : d + 10
-                                    var v00 = getCell(t, d), v10 = getCell(t+1, d)
-                                    var v01 = getCell(t, d+1), v11 = getCell(t+1, d+1)
+                                    var g0 = s - t
+                                    if (g0 < 0 || g0 >= 20) continue
+                                    var da = dispCol(t, g0), db = dispCol(t, g0+1)
+                                    var v00 = getCell(t, da), v10 = getCell(t+1, da)
+                                    var v01 = getCell(t, db), v11 = getCell(t+1, db)
                                     var p00 = project(t, g0, v00)
                                     var p10 = project(t+1, g0, v10)
                                     var p01 = project(t, g0+1, v01)

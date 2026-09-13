@@ -1,14 +1,15 @@
 ; Signed-byte cells stay in RAM; code and immutable constants live in flash.
 ;
 ; The grid is deliberately ragged, because a rectangular one would spend a
-; quarter of the EEPROM on a region with no content: negative duty under a
-; positive throttle only ever means "full forward torque".
+; quarter of the EEPROM on a region that holds no independent information:
+; for traction, duty is speed and its sign does not matter, so the negative
+; side is the positive side mirrored.
 ;
 ;   rows 0..9   brake levers -100%..-10%, 10% steps, 21 duty columns
 ;               spanning -100%..+100% - braking against speed on the right,
 ;               reverse on the left
 ;   rows 10..30 throttle 0..100%, 5% steps, 11 duty columns spanning
-;               0..100%; negative duty reads as column 0
+;               0..100%, read mirrored for negative duty
 ;
 ; 10*21 + 21*11 = 441 cells, the same budget a 21x21 grid would have used.
 @const-start
@@ -51,9 +52,12 @@
           (v1 (+ v10 (/ (* (- v11 v10) dw) 1000))))
         (+ v0 (/ (* (- v1 v0) pw) 1000))))
 
+; Mirrored on duty: rolling backwards reads the same curve as rolling
+; forwards at that speed, so engine braking and the balance point work in
+; both directions, with no discontinuity through zero.
 (defun map-lookup-drive (thr duty)
     (let ((tf (* (clamp-f thr 0 1000) 20))
-          (df (* (clamp-f duty 0 1000) 10))
+          (df (* (clamp-f (abs duty) 0 1000) 10))
           (t0 (min-f (+ 10 (/ tf 1000)) 30)) (d0 (min-f (/ df 1000) 10))
           (t1 (min-f (+ t0 1) 30)) (d1 (min-f (+ d0 1) 10))
           (tw (mod tf 1000)) (dw (mod df 1000))

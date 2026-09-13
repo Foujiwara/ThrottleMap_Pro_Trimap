@@ -3,13 +3,14 @@
 ## Runtime map
 
 The grid is deliberately **ragged**, because a rectangular one would spend
-a quarter of the EEPROM on a region with no content: negative duty under a
-positive throttle only ever means "full forward torque".
+a quarter of the EEPROM on a region holding no independent information:
+for traction, duty is speed and its sign carries nothing extra, so the
+negative side is the positive side mirrored.
 
 | Rows | Throttle | Columns | Duty |
 | --- | --- | --- | --- |
 | 0..9 | brake lever -100%..-10%, 10% steps | 21 | -100%..+100%, 10% steps |
-| 10..30 | throttle 0..100%, 5% steps | 11 | 0..100%, 10% steps |
+| 10..30 | throttle 0..100%, 5% steps | 11 | 0..100%, 10% steps, read mirrored for negative duty |
 
 `10*21 + 21*11 = 441` cells - the same budget a 21x21 grid would have
 used, but the traction half keeps its 5% throttle steps and the brake half
@@ -21,14 +22,18 @@ Row 10 is zero throttle. Zero lever is not stored: it is zero by
 definition, and having it as an implicit row lets a light pull fade in
 from nothing instead of jumping to the -10% row.
 
+Every view draws 21 display columns per row; on a traction row the two
+halves are the same cells, so editing one edits the other.
+
 ## Lookup
 
 Two lookups, each bilinear on its own uniform grid; nothing ever blends
 across the seam, since throttle and brake are separate inputs.
 
-- **throttle >= 0**: rows 10..30 against duty clamped to 0..1000, so
-  rolling backwards reads column 0 - full forward torque, not the fade a
-  high forward speed would have produced.
+- **throttle >= 0**: rows 10..30 against `|duty|`, so rolling backwards
+  reads the same curve as rolling forwards at that speed. Engine braking
+  and the balance point therefore work in both directions, and nothing is
+  discontinuous through zero.
 - **throttle < 0**: the brake rows against signed duty -1000..1000.
 
 Positive values command relative propulsion current, negative values
