@@ -12,8 +12,10 @@ The grid is **ragged**, on purpose:
 - **Brake rows**: lever 0..-100% in 10% steps, duty **-100%..+100%**. The
   right half is braking against speed, the left half is reverse.
 
-Negative duty under a positive throttle is not stored at all - it only
-ever means "full forward torque" - and that saved space is what pays for
+Negative duty under a positive throttle is not stored: for traction, duty
+is simply speed, so that side is the positive side **mirrored**. Rolling
+backwards reads the same curve as rolling forwards at the same speed, and
+engine braking works in both directions. The space saved is what pays for
 the traction half keeping its 5% steps.
 
 Each half has its own generator and its own regenerate flag, so shaping
