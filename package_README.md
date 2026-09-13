@@ -14,11 +14,10 @@ nothing about the feel changes.
 
 Each half has its own generator and its own regenerate flag, so shaping
 one never discards hand edits made to the other. The brake generator
-defaults to a negative current **proportional to both lever travel and
-duty** - the mirror of the traction side, no bite at a standstill, full
-bite at full speed - and exposes four settings: brake strength at full
-lever, lever response, speed dependence (0 makes it flat across speed,
-i.e. the plain proportional lever brake) and the speed curve.
+defaults to a negative current that **tracks lever travel alone** - -10%
+lever is -10% current at any speed - and exposes four settings: brake
+strength at full lever, lever response, speed dependence (0 is that flat
+default; 1 makes braking build with duty instead) and the speed curve.
 
 **Brake type** (lever only):
 

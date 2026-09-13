@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 3
+    property int buildMarker: 4
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -123,7 +123,7 @@ Item {
     // Brake half generator - mirrors gen-brake-map in map.lisp
     property real cfgBrakeStr: 1.0
     property real cfgBrakeResp: 1.0
-    property real cfgBrakeDep: 1.0
+    property real cfgBrakeDep: 0.0
     property int cfgBrakeCurve: 0
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
@@ -1028,7 +1028,7 @@ Item {
 
                         Label { text: "Brake curve (negative rows)"; font.bold: true; color: "#ddd" }
                         Label {
-                            text: "Default is a negative current proportional to both lever travel and duty, the mirror of the traction side: no bite at a standstill, full bite at full speed."
+                            text: "Default is a negative current that tracks lever travel alone: -10% lever is -10% current at any speed. Raise Speed dependence to make braking build with duty instead."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         Flow {
@@ -1042,7 +1042,7 @@ Item {
                                 text: "Default brake curve"
                                 onClicked: {
                                     cfgBrakeStr = 1.0; cfgBrakeResp = 1.0
-                                    cfgBrakeDep = 1.0; cfgBrakeCurve = 0
+                                    cfgBrakeDep = 0.0; cfgBrakeCurve = 0
                                     brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true)
                                 }
                             }
@@ -1104,7 +1104,7 @@ Item {
                             Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgBrakeDep; onMoved: { cfgBrakeDep = value; requestBrakeRegen() } }
                         }
                         Label {
-                            text: "1.00 scales braking with duty, like the traction side. 0.00 makes it flat across speed, which is the plain proportional lever brake."
+                            text: "0.00 (default) is flat across speed: the lever alone sets the current. 1.00 scales braking with duty instead, so it barely bites at a standstill and fully at top speed."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         ColumnLayout {
@@ -1925,7 +1925,7 @@ Item {
                                         cfgRevErpm = obj.cfg.revErpm === undefined ? 500 : obj.cfg.revErpm
                                         cfgBrakeStr = obj.cfg.brakeStr === undefined ? 1.0 : obj.cfg.brakeStr
                                         cfgBrakeResp = obj.cfg.brakeResp === undefined ? 1.0 : obj.cfg.brakeResp
-                                        cfgBrakeDep = obj.cfg.brakeDep === undefined ? 1.0 : obj.cfg.brakeDep
+                                        cfgBrakeDep = obj.cfg.brakeDep === undefined ? 0.0 : obj.cfg.brakeDep
                                         cfgBrakeCurve = obj.cfg.brakeCurve === undefined ? 0 : obj.cfg.brakeCurve
                                     }
                                     regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()
