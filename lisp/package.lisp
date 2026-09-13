@@ -27,7 +27,7 @@
 ; Brake half generator - see gen-brake-map in map.lisp.
 (define cfg-brake-str 1.0)
 (define cfg-brake-resp 1.0)
-(define cfg-brake-dep 1.0)
+(define cfg-brake-dep 0.0)
 (define cfg-brake-curve 0)
 (define live-throttle 0)
 (define live-duty 0)

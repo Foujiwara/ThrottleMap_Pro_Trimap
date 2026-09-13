@@ -45,10 +45,12 @@ speed = (1 - duty_dep) + duty_dep * duty ^ (1 + brake_curve)
 cell  = -(peak * clamp01(speed))
 ```
 
-Defaults 1.0 / 1.0 / 1.0 / 0 give `-(lever * duty)`: a negative current
-proportional to both lever travel and speed, the mirror of the traction
-side. `duty_dep = 0` removes the speed term and leaves the plain
-proportional lever brake.
+Defaults 1.0 / 1.0 / **0.0** / 0 give `-lever`: a negative current that
+tracks lever travel alone, flat across duty, so -10% lever is -10%
+current at any speed. `duty_dep = 1.0` makes braking fully proportional
+to duty instead - which reads as "inverted" against the traction half,
+since it puts zero braking in the low-duty column where traction pulls
+hardest.
 
 ## Brake type
 

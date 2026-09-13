@@ -71,12 +71,13 @@
                     (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
                                         width shape brake overrun curve)))))))
 
-; Brake half generator: negative current scaled by the lever and, by
-; default, by duty as well - the braking mirror of the traction law.
+; Brake half generator: negative current scaled by the lever, and
+; optionally by duty as well.
 ;   peak  = strength * lever ^ response
 ;   speed = (1 - duty_dep) + duty_dep * duty ^ (1 + curve)
-; duty_dep 1.0 gives a brake fully proportional to speed, 0.0 one that is
-; flat across duty (the plain lever brake).
+; duty_dep 0.0 (the default) is flat across duty, so the command tracks
+; lever travel alone: -10% lever is -10% current at any speed. 1.0 makes
+; braking fully proportional to speed instead.
 (defun brake-cell (b duty strength resp dep curve)
     (let ((peak (* strength (pow b resp)))
           (speed (clamp01 (+ (- 1.0 dep) (* dep (pow duty (+ 1.0 curve)))))))

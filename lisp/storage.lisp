@@ -147,7 +147,7 @@
     (progn
         (setq cfg-brake-str 1.0)
         (setq cfg-brake-resp 1.0)
-        (setq cfg-brake-dep 1.0)
+        (setq cfg-brake-dep 0.0)
         (setq cfg-brake-curve 0)))
 
 (defun storage-apply-image (b)
