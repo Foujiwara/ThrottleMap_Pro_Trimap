@@ -1,11 +1,14 @@
 ; EEPROM image for the 31x11 map. The header is packed (i16 scaled by 1000
 ; instead of f32) so the taller map fits: 36 bytes of header + 344 bytes of
-; cells = 95 of the 127 data slots, slot 127 holds CRC16 of slots 0..126.
+; cells + an 8-byte brake-generator tail = 97 of the 127 data slots, and
+; slot 127 holds CRC16 of slots 0..126.
 ; Images written by the 21x21 packages are migrated on read, never written.
 (define storage-busy nil)
 
 @const-start
-(define eeprom-magic 20260914)
+(define eeprom-magic 20260915)
+; 20260914 shares this layout minus the brake-generator tail at 380.
+(define eeprom-magic-b0 20260914)
 (define eeprom-legacy-magic 20260913)
 (define eeprom-legacy-magic0 20260912)
 (define eeprom-map-base 36)
@@ -45,6 +48,12 @@
         (bufset-u8 b 30 cfg-brake-map)
         (bufset-u8 b 31 cfg-brake-type)
         (bufset-i16 b 32 cfg-rev-erpm)
+        ; Brake generator lives past the map so a 20260914 image stays a
+        ; readable prefix of this one.
+        (bufset-i16 b 380 (to-fp cfg-brake-str))
+        (bufset-i16 b 382 (to-fp cfg-brake-resp))
+        (bufset-i16 b 384 (to-fp cfg-brake-dep))
+        (bufset-u8 b 386 cfg-brake-curve)
         (looprange s 0 eeprom-map-slots
             (bufset-u32 b (+ eeprom-map-base (* s 4))
                 (pack4 (map-cell-flat-i8 (* s 4))
@@ -127,6 +136,20 @@
         (in-range (bufget-i16 b 32) 0 20000)
         (storage-cells-valid b eeprom-map-base map-cells)))
 
+(defun storage-tail-valid (b)
+    (and
+        (in-range (bufget-i16 b 380) 0 1000)
+        (in-range (bufget-i16 b 382) 300 2000)
+        (in-range (bufget-i16 b 384) 0 1000)
+        (in-range (bufget-u8 b 386) 0 3)))
+
+(defun storage-brake-defaults ()
+    (progn
+        (setq cfg-brake-str 1.0)
+        (setq cfg-brake-resp 1.0)
+        (setq cfg-brake-dep 1.0)
+        (setq cfg-brake-curve 0)))
+
 (defun storage-apply-image (b)
     (progn
         (setq thr-cfg-source (bufget-u8 b 4))
@@ -148,6 +171,10 @@
         (setq cfg-brake-map (bufget-u8 b 30))
         (setq cfg-brake-type (bufget-u8 b 31))
         (setq cfg-rev-erpm (bufget-i16 b 32))
+        (setq cfg-brake-str (fp-to-f (bufget-i16 b 380)))
+        (setq cfg-brake-resp (fp-to-f (bufget-i16 b 382)))
+        (setq cfg-brake-dep (fp-to-f (bufget-i16 b 384)))
+        (setq cfg-brake-curve (bufget-u8 b 386))
         (looprange i 0 map-cells
             (bufset-i8 map-buf i (storage-image-cell b i)))
         (thr-reset-state)
@@ -199,11 +226,12 @@
         (setq cfg-brake-map 0)
         (setq cfg-brake-type 0)
         (setq cfg-rev-erpm 500)
+        (storage-brake-defaults)
         (looprange ti 0 21
             (looprange di 0 11
                 (bufset-i8 map-buf (map-idx (+ ti map-thr-zero) di)
                     (storage-cell-at b 60 (+ (* ti 21) (* di 2))))))
-        (gen-brake-map)
+        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve)
         (thr-reset-state)
         t))
 
@@ -213,8 +241,9 @@
         (if (not (number? magic))
             nil
             (let ((legacy (or (= magic eeprom-legacy-magic)
-                              (= magic eeprom-legacy-magic0))))
-                (if (not (or legacy (= magic eeprom-magic)))
+                              (= magic eeprom-legacy-magic0)))
+                  (beta0 (= magic eeprom-magic-b0)))
+                (if (not (or legacy beta0 (= magic eeprom-magic)))
                     nil
                     (let ((b (array-create 508)) (ok t))
                         (progn (looprange s 0 127
@@ -227,9 +256,15 @@
                             (legacy (if (storage-legacy-valid b)
                                         (storage-apply-legacy b) nil))
                             ((and (storage-image-valid b)
+                                  (or beta0 (storage-tail-valid b))
                                   (let ((sum (eeprom-read-i 127)))
                                       (and (number? sum) (= sum (crc16 b)))))
-                                (storage-apply-image b))
+                                (progn
+                                    (storage-apply-image b)
+                                    ; A 20260914 image has no tail: keep the
+                                    ; defaults rather than reading zeros.
+                                    (if beta0 (storage-brake-defaults))
+                                    t))
                             (t nil)))))))))
 
 (defun storage-load ()
@@ -254,6 +289,7 @@
         (setq cfg-brake-map 0)
         (setq cfg-brake-type 0)
         (setq cfg-rev-erpm 500)
+        (storage-brake-defaults)
         (setq thr-cfg-source thr-src-adc)
         (setq thr-cfg-invert 0)
         (setq thr-cfg-min 20)
@@ -265,6 +301,6 @@
         (gen-thermal-map cfg-torque-resp cfg-speed-coupling cfg-trans-width
                          cfg-trans-shape cfg-high-hold cfg-engine-brake
                          cfg-overrun-regen cfg-regen-curve)
-        (gen-brake-map)
+        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve)
         t))
 @const-end

@@ -11,7 +11,7 @@ Map cells and throttle calibration use that same integer scale internally.
 | --- | --- | --- |
 | 01 | SET_CELL | 5: throttle:u8 duty:u8 value:i16 |
 | 02 | SET_MAP_ROW | 24: row:u8 and 11 values:i16 |
-| 03 | SET_CONFIG | 21: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 rev_erpm:i16 |
+| 03 | SET_CONFIG | 29: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 rev_erpm:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 |
 | 04 | SET_THROTTLE | 12: source:u8 invert:u8 min:i16 max:i16 deadband:i16 filter:i16 brake_mode:u8 |
 | 05 | SAVE | 1 |
 | 06 | LOAD | 1 |
@@ -20,10 +20,13 @@ Map cells and throttle calibration use that same integer scale internally.
 | 09 | REQUEST_CFG | 1 |
 | 0A | SET_TEST_THROTTLE | 3: value:i16, -1000..1000 (negative is a brake request) |
 
-The regenerate byte separates generator action from preset identity:
-1 regenerates even for Custom (preset 0); 0 preserves the current map even
-when importing a named preset. Regeneration rewrites throttle rows 10..30
-only and never touches the hand-tuned brake half.
+There are two independent regenerate flags. `regenerate` rebuilds throttle
+rows 10..30 from the thermal parameters; `regen_brake` rebuilds brake rows
+0..9 from brake_str/brake_resp/brake_dep/brake_curve. Neither touches the
+other half, so shaping one never discards hand edits made to the other.
+Either flag also separates generator action from preset identity: 1
+regenerates even for Custom (preset 0), 0 preserves the current map even
+when importing a named preset.
 
 brake_map 0/1 enables the negative-throttle rows. brake_type is 0 regen
 only, 1 current no reverse, 2 current bidirectional; rev_erpm (0..20000)
@@ -43,7 +46,7 @@ the throttle. min must be below max.
 | 80 | LIVE | 15: throttle:i16 duty:i16 erpm:i32 current_rel:i16 current_A:i16 brake:i16 |
 | 81 | MAP_ROW | 24: row:u8 and 11 values:i16 |
 | 82 | STATUS | 3: status:u8 original_command:u8 |
-| 83 | CFG_ECHO | 31: config fields, throttle fields, then brake map:u8 brake type:u8 rev erpm:i16 |
+| 83 | CFG_ECHO | 38: config fields, throttle fields, brake map:u8 brake type:u8 rev erpm:i16, then brake str:i16 brake resp:i16 brake dep:i16 brake curve:u8 |
 
 Status: 0 OK, 1 saved and verified, 2 loaded, 3 reset, 4 save failed,
 5 no valid saved image, 6 invalid packet, 7 command execution failed.
