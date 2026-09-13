@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 1
+    property int buildMarker: 2
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -1574,7 +1574,7 @@ Item {
                     }
                     Label {
                         text: ["Regen only: braking is set-brake-rel throughout, so the motor never produces torque against the direction of travel and never reverses.",
-                               "Current, no reverse: regen while rolling, then negative current below the threshold below so it pulls itself to a stop and holds - but it brakes again instead of driving if it ever starts rolling backwards.",
+                               "Current, no reverse: regen while rolling, then negative current below the threshold below, to pull it down to a complete stop. The moment it stops it latches back to regen until you let go of the lever, so it can never shunt backwards.",
                                "Current, bidirectional: same as above, and once stopped it keeps going into reverse."][cfgBrakeType]
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }

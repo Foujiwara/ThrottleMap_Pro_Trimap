@@ -28,6 +28,8 @@
 (define live-duty 0)
 (define live-cur-rel 0)
 (define live-brake 0)
+; Latched once "no reverse" braking has brought the vehicle to a stop.
+(define brake-stopped nil)
 ; One buffer per owner: telemetry never shares its buffer with the event task.
 (define row-packet (array-create 24))
 (define cfg-packet (array-create 31))
@@ -39,12 +41,25 @@
     (if (= cfg-brake-type 0)
         (set-brake-rel (fp-to-f mag))
         (let ((r (to-i (get-rpm))))
-            (if (or (> r cfg-rev-erpm)
-                    (and (= cfg-brake-type 1) (< r (- cfg-rev-erpm))))
-                ; Still rolling: regen. Type 1 also brakes when already
-                ; travelling backwards, so it can never drive in reverse.
-                (set-brake-rel (fp-to-f mag))
-                (set-current-rel (- (fp-to-f mag)))))))
+            (if (= cfg-brake-type 2)
+                ; Bidirectional: negative torque below the threshold, and
+                ; it keeps going once that torque has reversed the motor.
+                (if (> r cfg-rev-erpm)
+                    (set-brake-rel (fp-to-f mag))
+                    (set-current-rel (- (fp-to-f mag))))
+                (progn
+                    ; No reverse: negative torque only while it is still
+                    ; travelling forwards, and latched off the moment it
+                    ; reaches a stop. Deciding on speed alone oscillates -
+                    ; the torque reverses the motor, regen catches it, the
+                    ; speed lands back in the torque band, and it shunts
+                    ; backwards over and over. The latch clears when the
+                    ; lever is released or it rolls forwards again.
+                    (if (> r cfg-rev-erpm) (setq brake-stopped nil))
+                    (if (< r 50) (setq brake-stopped t))
+                    (if (or brake-stopped (> r cfg-rev-erpm))
+                        (set-brake-rel (fp-to-f mag))
+                        (set-current-rel (- (fp-to-f mag)))))))))
 
 (defun control-tick ()
     (if storage-busy
@@ -55,6 +70,7 @@
             (setq live-duty (to-fp (get-duty)))
             (let ((lever (> live-brake 0)))
                 (progn
+                    (if (not lever) (setq brake-stopped nil))
                     (setq live-cur-rel
                         (if thr-expired 0
                             (if (and lever (= cfg-brake-map 0))
