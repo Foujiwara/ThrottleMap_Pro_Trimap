@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 4
+    property int buildMarker: 5
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -84,6 +84,14 @@ Item {
     function firstRow() { return cfgBrakeMap === 1 ? 0 : mapThrZero }
     // Signed throttle actually in effect right now, for the live dot.
     function liveSigned() { return liveBrake > 0 ? -liveBrake : liveThrottle }
+    // Column the live point sits in. The brake rows' duty axis is REVERSE
+    // duty, and only a bidirectional brake can ever climb it - mirrors
+    // control-tick in package.lisp.
+    function liveDutyAxis() {
+        if (liveBrake > 0 && cfgBrakeMap === 1)
+            return cfgBrakeType === 2 ? Math.max(0, Math.min(1, -liveDuty)) : 0
+        return Math.abs(liveDuty)
+    }
 
     // ---------------------------------------------------------------
     // Map data model: flat JS array, row-major [thrIdx*mapDutyN + dutyIdx]
@@ -123,7 +131,9 @@ Item {
     // Brake half generator - mirrors gen-brake-map in map.lisp
     property real cfgBrakeStr: 1.0
     property real cfgBrakeResp: 1.0
-    property real cfgBrakeDep: 0.0
+    property real cfgBrakeCoupling: 1.0
+    property real cfgBrakeWidth: 0.10
+    property real cfgBrakeOverrun: 0.12
     property int cfgBrakeCurve: 0
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
@@ -155,7 +165,9 @@ Item {
             if (c.revErpm !== undefined) range(c.revErpm,0,20000,true)
             if (c.brakeStr !== undefined) range(c.brakeStr,0,1,false)
             if (c.brakeResp !== undefined) range(c.brakeResp,0.3,2,false)
-            if (c.brakeDep !== undefined) range(c.brakeDep,0,1,false)
+            if (c.brakeCoupling !== undefined) range(c.brakeCoupling,0,1.5,false)
+            if (c.brakeWidth !== undefined) range(c.brakeWidth,0.02,0.3,false)
+            if (c.brakeOverrun !== undefined) range(c.brakeOverrun,0,0.5,false)
             if (c.brakeCurve !== undefined) range(c.brakeCurve,0,3,true)
         }
     }
@@ -236,7 +248,9 @@ Item {
         b = b.concat(i16Bytes(cfgRevErpm))
         b = b.concat(i16Bytes(fxEnc(cfgBrakeStr)))
         b = b.concat(i16Bytes(fxEnc(cfgBrakeResp)))
-        b = b.concat(i16Bytes(fxEnc(cfgBrakeDep)))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeCoupling)))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeWidth)))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeOverrun)))
         b.push(cfgBrakeCurve & 0xff)
         b.push(regenBrake === true ? 1 : 0)
         sendPacket(b)
@@ -373,7 +387,7 @@ Item {
             pendingPacket = null
             pumpTx()
         } else if (cmd === rxCfgEcho) {
-            if (view.byteLength !== 38) return
+            if (view.byteLength !== 42) return
             cfgReceived = true
             cfgPreset = view.getUint8(1)
             cfgTorqueResp = fxDec(view.getInt16(2, false))
@@ -396,8 +410,10 @@ Item {
             cfgRevErpm = view.getInt16(29, false)
             cfgBrakeStr = fxDec(view.getInt16(31, false))
             cfgBrakeResp = fxDec(view.getInt16(33, false))
-            cfgBrakeDep = fxDec(view.getInt16(35, false))
-            cfgBrakeCurve = view.getUint8(37)
+            cfgBrakeCoupling = fxDec(view.getInt16(35, false))
+            cfgBrakeWidth = fxDec(view.getInt16(37, false))
+            cfgBrakeOverrun = fxDec(view.getInt16(39, false))
+            cfgBrakeCurve = view.getUint8(41)
         }
     }
 
@@ -474,17 +490,28 @@ Item {
     property Timer brakeRegenDebounce: Timer { interval: 60; onTriggered: { regenerateLocalBrake(); sendSetConfig(false, true) } }
     function requestBrakeRegen() { brakeRegenDebounce.restart() }
 
-    // QML mirror of gen-brake-map: the brake half of the map, negative
-    // current scaled by lever travel and (by default) by duty too.
+    // QML mirror of gen-brake-map: the brake half, built with the same
+    // balance/taper/overrun shape as the traction half, over reverse duty.
     function regenerateLocalBrake() {
         var arr = mapData.slice()
         for (var bi = 0; bi < mapThrZero; bi++) {
             var lever = (mapThrZero - bi) / 10.0
             var peak = cfgBrakeStr * Math.pow(lever, cfgBrakeResp)
+            var balance = Math.max(0, Math.min(1, lever * cfgBrakeCoupling))
+            var start = Math.max(0, Math.min(1, balance - cfgBrakeWidth))
             for (var di = 0; di < mapDutyN; di++) {
-                var duty = di / (mapDutyN - 1)
-                var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
-                arr[cellIdx(bi, di)] = quantizeCell(-peak * Math.max(0, Math.min(1, speed)))
+                var rev = di / (mapDutyN - 1)
+                var val
+                if (cfgBrakeCoupling === 0) val = -peak
+                else if (rev <= start) val = -peak
+                else if (rev <= balance) {
+                    var p = (rev - start) / Math.max(0.001, balance - start)
+                    val = -peak * (1 - shapeCurve(p, 1))
+                } else {
+                    var over = (rev - balance) / Math.max(0.001, 1 - balance)
+                    val = cfgBrakeOverrun * Math.pow(Math.max(0, Math.min(1, over)), 1 + cfgBrakeCurve)
+                }
+                arr[cellIdx(bi, di)] = quantizeCell(val)
             }
         }
         mapData = arr
@@ -771,7 +798,7 @@ Item {
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.clearRect(0, 0, width, height)
-                            var lx = Math.abs(liveDuty) * width
+                            var lx = liveDutyAxis() * width
                             // Centre of the band the live throttle sits in,
                             // so the dot lines up with the cell it reads.
                             var ly = height - (rowPosOf(liveSigned()) - heatmap.rowBase + 0.5) * heatmap.ch
@@ -809,7 +836,7 @@ Item {
                     }
 
                     // axis labels
-                    Label { text: cfgBrakeMap === 1 ? "Brake -100%" : "Throttle 0%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: cfgBrakeMap === 1 ? "Brake -100%  (duty axis = reverse duty here)" : "Throttle 0%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Duty 100%"; color: "#888"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Throttle +100%"; color: "#888"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
                 }
@@ -1028,7 +1055,7 @@ Item {
 
                         Label { text: "Brake curve (negative rows)"; font.bold: true; color: "#ddd" }
                         Label {
-                            text: "Default is a negative current that tracks lever travel alone: -10% lever is -10% current at any speed. Raise Speed dependence to make braking build with duty instead."
+                            text: "The mirror of the traction side. Its horizontal axis is REVERSE duty, so the left column is the braking demand while still travelling forwards, and each lever position settles at its own reverse speed instead of accelerating backwards indefinitely."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         Flow {
@@ -1042,7 +1069,8 @@ Item {
                                 text: "Default brake curve"
                                 onClicked: {
                                     cfgBrakeStr = 1.0; cfgBrakeResp = 1.0
-                                    cfgBrakeDep = 0.0; cfgBrakeCurve = 0
+                                    cfgBrakeCoupling = 1.0; cfgBrakeWidth = 0.10
+                                    cfgBrakeOverrun = 0.12; cfgBrakeCurve = 0
                                     brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true)
                                 }
                             }
@@ -1089,37 +1117,71 @@ Item {
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
                             RowLayout { Layout.fillWidth: true
-                                Label { text: "Speed dependence"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                Label { text: "Reverse speed coupling"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
                                 TextField {
                                     Layout.preferredWidth: 60
                                     horizontalAlignment: TextInput.AlignRight
-                                    text: cfgBrakeDep.toFixed(2)
+                                    text: cfgBrakeCoupling.toFixed(2)
                                     onEditingFinished: {
-                                        var v = parseClamped(text, 0.0, 1.0)
-                                        if (v !== null) { cfgBrakeDep = v; requestBrakeRegen() }
-                                        text = Qt.binding(function() { return cfgBrakeDep.toFixed(2) })
+                                        var v = parseClamped(text, 0.0, 1.5)
+                                        if (v !== null) { cfgBrakeCoupling = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeCoupling.toFixed(2) })
                                     }
                                 }
                             }
-                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgBrakeDep; onMoved: { cfgBrakeDep = value; requestBrakeRegen() } }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.5; value: cfgBrakeCoupling; onMoved: { cfgBrakeCoupling = value; requestBrakeRegen() } }
                         }
                         Label {
-                            text: "0.00 (default) is flat across speed: the lever alone sets the current. 1.00 scales braking with duty instead, so it barely bites at a standstill and fully at top speed."
+                            text: "The reverse duty each lever position settles at: 1.00 means 10% lever backs up to 10% duty and then stops pulling. Lower is shorter-geared in reverse, 0.00 removes the limit entirely and leaves a flat plateau that keeps accelerating backwards."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
-                            Label { text: "Speed curve"; color: "#ccc" }
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Transition width"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgBrakeWidth.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.02, 0.30)
+                                        if (v !== null) { cfgBrakeWidth = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeWidth.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.02; to: 0.30; value: cfgBrakeWidth; onMoved: { cfgBrakeWidth = value; requestBrakeRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Reverse overrun"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgBrakeOverrun.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 0.50)
+                                        if (v !== null) { cfgBrakeOverrun = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeOverrun.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 0.50; value: cfgBrakeOverrun; onMoved: { cfgBrakeOverrun = value; requestBrakeRegen() } }
+                        }
+                        Label {
+                            text: "Past the balance point the cells go positive: forward torque, which pulls a runaway reverse back down instead of letting it build. Only reachable with a bidirectional brake."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Overrun curve"; color: "#ccc" }
                             ComboBox {
                                 Layout.fillWidth: true
                                 model: ["Linear", "Squared", "Cubed", "Fourth power"]
                                 currentIndex: cfgBrakeCurve
                                 onActivated: (idx) => { cfgBrakeCurve = idx; requestBrakeRegen() }
                             }
-                        }
-                        Label {
-                            text: "How the speed term ramps up. Linear is proportional; the higher powers keep braking gentle at low speed and pile it on near full duty."
-                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                     }
 
@@ -1390,7 +1452,7 @@ Item {
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.clearRect(0, 0, width, height)
-                            var lx2 = Math.abs(liveDuty) * width
+                            var lx2 = liveDutyAxis() * width
                             var ly = height/2 - liveCurRel * (height/2)
                             ctx.beginPath(); ctx.arc(lx2, ly, 5, 0, 2*Math.PI)
                             ctx.fillStyle = "#00e5ff"; ctx.fill()
@@ -1557,7 +1619,7 @@ Item {
                         var ctx = getContext("2d")
                         ctx.clearRect(0, 0, width, height)
                         var ti = rowPosOf(liveSigned())
-                        var di = Math.abs(liveDuty) * (mapDutyN-1)
+                        var di = liveDutyAxis() * (mapDutyN-1)
                         var lp = isoCanvas.project(ti, di, liveCurRel)
                         ctx.beginPath(); ctx.arc(lp.x, lp.y, 5, 0, 2*Math.PI)
                         ctx.fillStyle = "#00e5ff"; ctx.fill()
@@ -1903,7 +1965,8 @@ Item {
                             thrDeadband: thrDeadband, thrFilter: thrFilter, thrBrakeMode: thrBrakeMode,
                             brakeMap: cfgBrakeMap, brakeType: cfgBrakeType, revErpm: cfgRevErpm,
                             brakeStr: cfgBrakeStr, brakeResp: cfgBrakeResp,
-                            brakeDep: cfgBrakeDep, brakeCurve: cfgBrakeCurve } }) }
+                            brakeCoupling: cfgBrakeCoupling, brakeWidth: cfgBrakeWidth,
+                            brakeOverrun: cfgBrakeOverrun, brakeCurve: cfgBrakeCurve } }) }
                         Button {
                             text: "Import from text"
                             onClicked: {
@@ -1925,7 +1988,9 @@ Item {
                                         cfgRevErpm = obj.cfg.revErpm === undefined ? 500 : obj.cfg.revErpm
                                         cfgBrakeStr = obj.cfg.brakeStr === undefined ? 1.0 : obj.cfg.brakeStr
                                         cfgBrakeResp = obj.cfg.brakeResp === undefined ? 1.0 : obj.cfg.brakeResp
-                                        cfgBrakeDep = obj.cfg.brakeDep === undefined ? 0.0 : obj.cfg.brakeDep
+                                        cfgBrakeCoupling = obj.cfg.brakeCoupling === undefined ? 1.0 : obj.cfg.brakeCoupling
+                                        cfgBrakeWidth = obj.cfg.brakeWidth === undefined ? 0.10 : obj.cfg.brakeWidth
+                                        cfgBrakeOverrun = obj.cfg.brakeOverrun === undefined ? 0.12 : obj.cfg.brakeOverrun
                                         cfgBrakeCurve = obj.cfg.brakeCurve === undefined ? 0 : obj.cfg.brakeCurve
                                     }
                                     regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()

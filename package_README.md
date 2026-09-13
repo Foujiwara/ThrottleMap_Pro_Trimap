@@ -13,11 +13,13 @@ steps to make room in the EEPROM; the lookup interpolates duty, so
 nothing about the feel changes.
 
 Each half has its own generator and its own regenerate flag, so shaping
-one never discards hand edits made to the other. The brake generator
-defaults to a negative current that **tracks lever travel alone** - -10%
-lever is -10% current at any speed - and exposes four settings: brake
-strength at full lever, lever response, speed dependence (0 is that flat
-default; 1 makes braking build with duty instead) and the speed curve.
+one never discards hand edits made to the other. The brake generator is the **mirror of the traction one**: its horizontal
+axis is reverse duty, so -10% lever brakes at -0.10 while you are still
+going forwards, and in bidirectional mode backs up only to 10% duty
+before it stops pulling - instead of accelerating backwards to full
+speed. Settings: brake strength at full lever, lever response, reverse
+speed coupling (0 removes the limit), transition width, reverse overrun
+and its curve.
 
 **Brake type** (lever only):
 

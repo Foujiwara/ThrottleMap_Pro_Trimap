@@ -39,18 +39,30 @@ while retaining the released-row brake. QML previews the same formula.
 generator of its own, on its own flag, and neither half can overwrite the
 other:
 
+**The brake rows' duty axis is reverse duty**, not forward duty. Column 0
+means "not travelling backwards at all", which covers both a standstill
+and any forward speed, and holds the full braking demand for that lever
+position. The law is the mirror of `thermal-cell`:
+
 ```
-peak  = brake_strength * lever ^ brake_response
-speed = (1 - duty_dep) + duty_dep * duty ^ (1 + brake_curve)
-cell  = -(peak * clamp01(speed))
+peak    = brake_strength * lever ^ brake_response
+balance = clamp01(lever * brake_coupling)
+start   = clamp01(balance - brake_width)
+
+rev <= start    : -peak                              pulling backwards
+rev <= balance  : -peak * (1 - p^2)                  fading to its reverse speed
+rev >  balance  : +brake_overrun * over^(1 + curve)  forward torque, pulls it back
 ```
 
-Defaults 1.0 / 1.0 / **0.0** / 0 give `-lever`: a negative current that
-tracks lever travel alone, flat across duty, so -10% lever is -10%
-current at any speed. `duty_dep = 1.0` makes braking fully proportional
-to duty instead - which reads as "inverted" against the traction half,
-since it puts zero braking in the low-duty column where traction pulls
-hardest.
+Defaults 1.0 / 1.0 / 1.0 / 0.10 / 0.12 / 0 give -10% lever = -0.10
+current while travelling forwards, settling at 10% reverse duty instead
+of accelerating backwards indefinitely. `brake_coupling = 0` removes the
+balance and leaves a flat plateau.
+
+The positive cells past balance are forward torque: applied while
+actually travelling backwards, they decelerate the reverse. Only a
+bidirectional brake can reach them - for the other two types the control
+loop pins the axis at column 0, so the brake half is pure braking.
 
 ## Brake type
 
@@ -69,12 +81,12 @@ merely released.
 
 ## EEPROM layout
 
-There are 128 persistent 32-bit slots. Format marker 20260915. The header
+There are 128 persistent 32-bit slots. Format marker 20260916. The header
 is packed into 9 slots (i16 scaled by 1000 instead of float32) so that
 the taller map still fits, and the brake generator sits in a two-slot
-tail *after* the map, so a 20260914 image is a readable prefix of this
-one: it loads normally and the brake-generator settings fall back to
-their defaults.
+tail *after* the map, so an earlier beta image (20260914, 20260915) is a
+readable prefix of this one: it loads normally and the brake-generator
+settings fall back to their defaults.
 
 | Offset | Content |
 | --- | --- |
@@ -88,10 +100,10 @@ their defaults.
 | 28..31 | Transition shape, regen curve, brake map on, brake type (u8 each) |
 | 32 | Reverse-threshold ERPM, i16 |
 | 36..379 | Four map bytes per word; first cell in least significant byte |
-| 380, 382, 384, 386 | Brake strength, response, speed dependence (i16 x1000), speed curve (u8) |
+| 380..390 | Brake strength, response, reverse coupling, transition width, reverse overrun (i16 x1000), overrun curve (u8) |
 | Slot 127 | CRC16 of slots 0..126 encoded as big-endian words |
 
-That is 97 of the 127 data slots; the remaining ones are written as zero
+That is 98 of the 127 data slots; the remaining ones are written as zero
 and are free for later use.
 
 Each cell is stored as signed_value + 128. Padding cells in the last slot
