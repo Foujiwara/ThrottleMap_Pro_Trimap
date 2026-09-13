@@ -39,30 +39,44 @@ while retaining the released-row brake. QML previews the same formula.
 generator of its own, on its own flag, and neither half can overwrite the
 other:
 
-**The brake rows' duty axis is reverse duty**, not forward duty. Column 0
-means "not travelling backwards at all", which covers both a standstill
-and any forward speed, and holds the full braking demand for that lever
-position. The law is the mirror of `thermal-cell`:
+The brake rows sit on the **same |duty| axis as the traction rows**, so
+the whole map reads one way: how hard the lever brakes at each speed.
 
 ```
-peak    = brake_strength * lever ^ brake_response
-balance = clamp01(lever * brake_coupling)
-start   = clamp01(balance - brake_width)
-
-rev <= start    : -peak                              pulling backwards
-rev <= balance  : -peak * (1 - p^2)                  fading to its reverse speed
-rev >  balance  : +brake_overrun * over^(1 + curve)  forward torque, pulls it back
+peak  = brake_strength * lever ^ brake_response
+speed = (1 - duty_dep) + duty_dep * duty ^ (1 + brake_curve)
+cell  = -(peak * clamp01(speed))
 ```
 
-Defaults 1.0 / 1.0 / 1.0 / 0.10 / 0.12 / 0 give -10% lever = -0.10
-current while travelling forwards, settling at 10% reverse duty instead
-of accelerating backwards indefinitely. `brake_coupling = 0` removes the
-balance and leaves a flat plateau.
+Defaults 1.0 / 1.0 / 0.0 / 0 give `-lever`, flat across speed: -10% lever
+is -0.10 at any duty. Raising duty_dep fades braking out towards a
+standstill.
 
-The positive cells past balance are forward torque: applied while
-actually travelling backwards, they decelerate the reverse. Only a
-bidirectional brake can reach them - for the other two types the control
-loop pins the axis at column 0, so the brake half is pure braking.
+## Reverse limit
+
+How far back the lever may drive is **not** in the cells. Putting it
+there would spend all 11 columns on a low-speed manoeuvre and leave
+braking-while-riding as a single number per row. It is a separate
+closed-form limiter (`brake-reverse` in package.lisp), applied on top of
+the cell value and only while the controller is genuinely travelling
+backwards - so it can never cost braking on the way there:
+
+```
+balance = clamp(lever * rev_coupling)
+start   = max(0, balance - rev_width)
+
+rev <= start    : cell                        pulling backwards
+rev <= balance  : cell * (1 - p^2)            fading to its reverse speed
+rev >  balance  : +rev_overrun * over^2       forward torque, pulls it back
+```
+
+Defaults 1.0 / 0.10 / 0.12: 30% of lever backs up to 30% duty and stops
+pulling. `rev_coupling = 0` removes the limit. The parameters are stored
+and carried as integers scaled by 1000, because unlike the generator
+settings they are read by the control loop on every braking tick.
+
+Only a bidirectional brake reaches this at all; the other two types
+cannot travel backwards under power.
 
 ## Brake type
 
@@ -81,12 +95,12 @@ merely released.
 
 ## EEPROM layout
 
-There are 128 persistent 32-bit slots. Format marker 20260916. The header
+There are 128 persistent 32-bit slots. Format marker 20260917. The header
 is packed into 9 slots (i16 scaled by 1000 instead of float32) so that
 the taller map still fits, and the brake generator sits in a two-slot
-tail *after* the map, so an earlier beta image (20260914, 20260915) is a
+tail *after* the map, so an earlier beta image (20260914..20260916) is a
 readable prefix of this one: it loads normally and the brake-generator
-settings fall back to their defaults.
+and reverse-limit settings fall back to their defaults.
 
 | Offset | Content |
 | --- | --- |
@@ -100,10 +114,10 @@ settings fall back to their defaults.
 | 28..31 | Transition shape, regen curve, brake map on, brake type (u8 each) |
 | 32 | Reverse-threshold ERPM, i16 |
 | 36..379 | Four map bytes per word; first cell in least significant byte |
-| 380..390 | Brake strength, response, reverse coupling, transition width, reverse overrun (i16 x1000), overrun curve (u8) |
+| 380..392 | Brake strength, response, speed dependence (i16 x1000), speed curve (u8), then reverse coupling, width, overrun (i16 x1000) |
 | Slot 127 | CRC16 of slots 0..126 encoded as big-endian words |
 
-That is 98 of the 127 data slots; the remaining ones are written as zero
+That is 99 of the 127 data slots; the remaining ones are written as zero
 and are free for later use.
 
 Each cell is stored as signed_value + 128. Padding cells in the last slot

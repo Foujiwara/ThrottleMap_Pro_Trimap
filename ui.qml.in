@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 5
+    property int buildMarker: 6
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -84,14 +84,8 @@ Item {
     function firstRow() { return cfgBrakeMap === 1 ? 0 : mapThrZero }
     // Signed throttle actually in effect right now, for the live dot.
     function liveSigned() { return liveBrake > 0 ? -liveBrake : liveThrottle }
-    // Column the live point sits in. The brake rows' duty axis is REVERSE
-    // duty, and only a bidirectional brake can ever climb it - mirrors
-    // control-tick in package.lisp.
-    function liveDutyAxis() {
-        if (liveBrake > 0 && cfgBrakeMap === 1)
-            return cfgBrakeType === 2 ? Math.max(0, Math.min(1, -liveDuty)) : 0
-        return Math.abs(liveDuty)
-    }
+    // One axis for the whole map: absolute duty, brake rows included.
+    function liveDutyAxis() { return Math.abs(liveDuty) }
 
     // ---------------------------------------------------------------
     // Map data model: flat JS array, row-major [thrIdx*mapDutyN + dutyIdx]
@@ -131,10 +125,12 @@ Item {
     // Brake half generator - mirrors gen-brake-map in map.lisp
     property real cfgBrakeStr: 1.0
     property real cfgBrakeResp: 1.0
-    property real cfgBrakeCoupling: 1.0
-    property real cfgBrakeWidth: 0.10
-    property real cfgBrakeOverrun: 0.12
+    property real cfgBrakeDep: 0.0
     property int cfgBrakeCurve: 0
+    // Reverse limiter, fixed point (x1000) to match the control loop
+    property int cfgRevCoupling: 1000
+    property int cfgRevWidth: 100
+    property int cfgRevOverrun: 120
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
     property int thrInvert: 0
@@ -165,9 +161,10 @@ Item {
             if (c.revErpm !== undefined) range(c.revErpm,0,20000,true)
             if (c.brakeStr !== undefined) range(c.brakeStr,0,1,false)
             if (c.brakeResp !== undefined) range(c.brakeResp,0.3,2,false)
-            if (c.brakeCoupling !== undefined) range(c.brakeCoupling,0,1.5,false)
-            if (c.brakeWidth !== undefined) range(c.brakeWidth,0.02,0.3,false)
-            if (c.brakeOverrun !== undefined) range(c.brakeOverrun,0,0.5,false)
+            if (c.brakeDep !== undefined) range(c.brakeDep,0,1,false)
+            if (c.revCoupling !== undefined) range(c.revCoupling,0,1500,true)
+            if (c.revWidth !== undefined) range(c.revWidth,20,300,true)
+            if (c.revOverrun !== undefined) range(c.revOverrun,0,500,true)
             if (c.brakeCurve !== undefined) range(c.brakeCurve,0,3,true)
         }
     }
@@ -248,11 +245,12 @@ Item {
         b = b.concat(i16Bytes(cfgRevErpm))
         b = b.concat(i16Bytes(fxEnc(cfgBrakeStr)))
         b = b.concat(i16Bytes(fxEnc(cfgBrakeResp)))
-        b = b.concat(i16Bytes(fxEnc(cfgBrakeCoupling)))
-        b = b.concat(i16Bytes(fxEnc(cfgBrakeWidth)))
-        b = b.concat(i16Bytes(fxEnc(cfgBrakeOverrun)))
+        b = b.concat(i16Bytes(fxEnc(cfgBrakeDep)))
         b.push(cfgBrakeCurve & 0xff)
         b.push(regenBrake === true ? 1 : 0)
+        b = b.concat(i16Bytes(cfgRevCoupling))
+        b = b.concat(i16Bytes(cfgRevWidth))
+        b = b.concat(i16Bytes(cfgRevOverrun))
         sendPacket(b)
     }
     function sendSetThrottle() {
@@ -387,7 +385,7 @@ Item {
             pendingPacket = null
             pumpTx()
         } else if (cmd === rxCfgEcho) {
-            if (view.byteLength !== 42) return
+            if (view.byteLength !== 44) return
             cfgReceived = true
             cfgPreset = view.getUint8(1)
             cfgTorqueResp = fxDec(view.getInt16(2, false))
@@ -410,10 +408,11 @@ Item {
             cfgRevErpm = view.getInt16(29, false)
             cfgBrakeStr = fxDec(view.getInt16(31, false))
             cfgBrakeResp = fxDec(view.getInt16(33, false))
-            cfgBrakeCoupling = fxDec(view.getInt16(35, false))
-            cfgBrakeWidth = fxDec(view.getInt16(37, false))
-            cfgBrakeOverrun = fxDec(view.getInt16(39, false))
-            cfgBrakeCurve = view.getUint8(41)
+            cfgBrakeDep = fxDec(view.getInt16(35, false))
+            cfgBrakeCurve = view.getUint8(37)
+            cfgRevCoupling = view.getInt16(38, false)
+            cfgRevWidth = view.getInt16(40, false)
+            cfgRevOverrun = view.getInt16(42, false)
         }
     }
 
@@ -490,28 +489,16 @@ Item {
     property Timer brakeRegenDebounce: Timer { interval: 60; onTriggered: { regenerateLocalBrake(); sendSetConfig(false, true) } }
     function requestBrakeRegen() { brakeRegenDebounce.restart() }
 
-    // QML mirror of gen-brake-map: the brake half, built with the same
-    // balance/taper/overrun shape as the traction half, over reverse duty.
+    // QML mirror of gen-brake-map: braking demand against forward speed.
     function regenerateLocalBrake() {
         var arr = mapData.slice()
         for (var bi = 0; bi < mapThrZero; bi++) {
             var lever = (mapThrZero - bi) / 10.0
             var peak = cfgBrakeStr * Math.pow(lever, cfgBrakeResp)
-            var balance = Math.max(0, Math.min(1, lever * cfgBrakeCoupling))
-            var start = Math.max(0, Math.min(1, balance - cfgBrakeWidth))
             for (var di = 0; di < mapDutyN; di++) {
-                var rev = di / (mapDutyN - 1)
-                var val
-                if (cfgBrakeCoupling === 0) val = -peak
-                else if (rev <= start) val = -peak
-                else if (rev <= balance) {
-                    var p = (rev - start) / Math.max(0.001, balance - start)
-                    val = -peak * (1 - shapeCurve(p, 1))
-                } else {
-                    var over = (rev - balance) / Math.max(0.001, 1 - balance)
-                    val = cfgBrakeOverrun * Math.pow(Math.max(0, Math.min(1, over)), 1 + cfgBrakeCurve)
-                }
-                arr[cellIdx(bi, di)] = quantizeCell(val)
+                var duty = di / (mapDutyN - 1)
+                var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
+                arr[cellIdx(bi, di)] = quantizeCell(-peak * Math.max(0, Math.min(1, speed)))
             }
         }
         mapData = arr
@@ -836,7 +823,7 @@ Item {
                     }
 
                     // axis labels
-                    Label { text: cfgBrakeMap === 1 ? "Brake -100%  (duty axis = reverse duty here)" : "Throttle 0%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
+                    Label { text: cfgBrakeMap === 1 ? "Brake -100%" : "Throttle 0%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Duty 100%"; color: "#888"; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label { text: "Throttle +100%"; color: "#888"; anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 4 }
                 }
@@ -1055,7 +1042,7 @@ Item {
 
                         Label { text: "Brake curve (negative rows)"; font.bold: true; color: "#ddd" }
                         Label {
-                            text: "The mirror of the traction side. Its horizontal axis is REVERSE duty, so the left column is the braking demand while still travelling forwards, and each lever position settles at its own reverse speed instead of accelerating backwards indefinitely."
+                            text: "Shapes how hard the lever brakes at each speed, on the same duty axis as the traction half. Default is flat: -10% lever is -10% current at any speed. How far back the lever may drive is separate, in Reverse limit on the Config tab."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         Flow {
@@ -1069,8 +1056,7 @@ Item {
                                 text: "Default brake curve"
                                 onClicked: {
                                     cfgBrakeStr = 1.0; cfgBrakeResp = 1.0
-                                    cfgBrakeCoupling = 1.0; cfgBrakeWidth = 0.10
-                                    cfgBrakeOverrun = 0.12; cfgBrakeCurve = 0
+                                    cfgBrakeDep = 0.0; cfgBrakeCurve = 0
                                     brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true)
                                 }
                             }
@@ -1117,65 +1103,27 @@ Item {
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
                             RowLayout { Layout.fillWidth: true
-                                Label { text: "Reverse speed coupling"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                Label { text: "Speed dependence"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
                                 TextField {
                                     Layout.preferredWidth: 60
                                     horizontalAlignment: TextInput.AlignRight
-                                    text: cfgBrakeCoupling.toFixed(2)
+                                    text: cfgBrakeDep.toFixed(2)
                                     onEditingFinished: {
-                                        var v = parseClamped(text, 0.0, 1.5)
-                                        if (v !== null) { cfgBrakeCoupling = v; requestBrakeRegen() }
-                                        text = Qt.binding(function() { return cfgBrakeCoupling.toFixed(2) })
+                                        var v = parseClamped(text, 0.0, 1.0)
+                                        if (v !== null) { cfgBrakeDep = v; requestBrakeRegen() }
+                                        text = Qt.binding(function() { return cfgBrakeDep.toFixed(2) })
                                     }
                                 }
                             }
-                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.5; value: cfgBrakeCoupling; onMoved: { cfgBrakeCoupling = value; requestBrakeRegen() } }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgBrakeDep; onMoved: { cfgBrakeDep = value; requestBrakeRegen() } }
                         }
                         Label {
-                            text: "The reverse duty each lever position settles at: 1.00 means 10% lever backs up to 10% duty and then stops pulling. Lower is shorter-geared in reverse, 0.00 removes the limit entirely and leaves a flat plateau that keeps accelerating backwards."
+                            text: "0.00 (default) brakes the same at every speed. Raise it to fade braking out towards a standstill, which keeps regen from grabbing at walking pace."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Transition width"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: cfgBrakeWidth.toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0.02, 0.30)
-                                        if (v !== null) { cfgBrakeWidth = v; requestBrakeRegen() }
-                                        text = Qt.binding(function() { return cfgBrakeWidth.toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider { Layout.fillWidth: true; from: 0.02; to: 0.30; value: cfgBrakeWidth; onMoved: { cfgBrakeWidth = value; requestBrakeRegen() } }
-                        }
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Reverse overrun"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: cfgBrakeOverrun.toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0.0, 0.50)
-                                        if (v !== null) { cfgBrakeOverrun = v; requestBrakeRegen() }
-                                        text = Qt.binding(function() { return cfgBrakeOverrun.toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider { Layout.fillWidth: true; from: 0.0; to: 0.50; value: cfgBrakeOverrun; onMoved: { cfgBrakeOverrun = value; requestBrakeRegen() } }
-                        }
-                        Label {
-                            text: "Past the balance point the cells go positive: forward torque, which pulls a runaway reverse back down instead of letting it build. Only reachable with a bidirectional brake."
-                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
-                        }
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            Label { text: "Overrun curve"; color: "#ccc" }
+                            Label { text: "Speed curve"; color: "#ccc" }
                             ComboBox {
                                 Layout.fillWidth: true
                                 model: ["Linear", "Squared", "Cubed", "Fourth power"]
@@ -1816,6 +1764,100 @@ Item {
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
+                    // Deliberately NOT in the map. The brake cells shape
+                    // braking against forward speed, which is what riding
+                    // uses; how far back the lever may drive is a separate
+                    // low-speed manoeuvre and gets its own three numbers,
+                    // applied on top of the cells only while actually
+                    // travelling backwards.
+                    ColumnLayout {
+                        visible: cfgBrakeType === 2
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+                        Label { text: "Reverse limit"; font.bold: true; color: "#ddd" }
+                        Label {
+                            text: "Applies only while genuinely rolling backwards, so it never costs you braking on the way there. Independent of the brake map."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Reverse speed coupling"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: (cfgRevCoupling / 1000).toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.5)
+                                        if (v !== null) { cfgRevCoupling = Math.round(v * 1000); sendSetConfig(false) }
+                                        text = Qt.binding(function() { return (cfgRevCoupling / 1000).toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider {
+                                Layout.fillWidth: true; from: 0; to: 1500; stepSize: 10
+                                value: cfgRevCoupling
+                                onMoved: cfgRevCoupling = Math.round(value)
+                                onPressedChanged: if (!pressed) sendSetConfig(false)
+                            }
+                        }
+                        Label {
+                            text: "The reverse duty each lever position settles at: 1.00 means 10% lever backs up to 10% duty and then stops pulling. Lower is shorter-geared in reverse; 0.00 removes the limit and it keeps accelerating backwards."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Transition width"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: (cfgRevWidth / 1000).toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.02, 0.30)
+                                        if (v !== null) { cfgRevWidth = Math.round(v * 1000); sendSetConfig(false) }
+                                        text = Qt.binding(function() { return (cfgRevWidth / 1000).toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider {
+                                Layout.fillWidth: true; from: 20; to: 300; stepSize: 5
+                                value: cfgRevWidth
+                                onMoved: cfgRevWidth = Math.round(value)
+                                onPressedChanged: if (!pressed) sendSetConfig(false)
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Runaway hold"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: (cfgRevOverrun / 1000).toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 0.50)
+                                        if (v !== null) { cfgRevOverrun = Math.round(v * 1000); sendSetConfig(false) }
+                                        text = Qt.binding(function() { return (cfgRevOverrun / 1000).toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider {
+                                Layout.fillWidth: true; from: 0; to: 500; stepSize: 5
+                                value: cfgRevOverrun
+                                onMoved: cfgRevOverrun = Math.round(value)
+                                onPressedChanged: if (!pressed) sendSetConfig(false)
+                            }
+                        }
+                        Label {
+                            text: "Forward torque applied past the balance point, to pull a reverse that is running away downhill back down to it."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                    }
+
                     // No ADC/PPM/UART hardware wired up yet? Pick "Test
                     // (bench, via USB)" above, then drag this - it drives
                     // the real control loop over the same USB/CAN link
@@ -1965,8 +2007,9 @@ Item {
                             thrDeadband: thrDeadband, thrFilter: thrFilter, thrBrakeMode: thrBrakeMode,
                             brakeMap: cfgBrakeMap, brakeType: cfgBrakeType, revErpm: cfgRevErpm,
                             brakeStr: cfgBrakeStr, brakeResp: cfgBrakeResp,
-                            brakeCoupling: cfgBrakeCoupling, brakeWidth: cfgBrakeWidth,
-                            brakeOverrun: cfgBrakeOverrun, brakeCurve: cfgBrakeCurve } }) }
+                            brakeDep: cfgBrakeDep, brakeCurve: cfgBrakeCurve,
+                            revCoupling: cfgRevCoupling, revWidth: cfgRevWidth,
+                            revOverrun: cfgRevOverrun } }) }
                         Button {
                             text: "Import from text"
                             onClicked: {
@@ -1988,9 +2031,10 @@ Item {
                                         cfgRevErpm = obj.cfg.revErpm === undefined ? 500 : obj.cfg.revErpm
                                         cfgBrakeStr = obj.cfg.brakeStr === undefined ? 1.0 : obj.cfg.brakeStr
                                         cfgBrakeResp = obj.cfg.brakeResp === undefined ? 1.0 : obj.cfg.brakeResp
-                                        cfgBrakeCoupling = obj.cfg.brakeCoupling === undefined ? 1.0 : obj.cfg.brakeCoupling
-                                        cfgBrakeWidth = obj.cfg.brakeWidth === undefined ? 0.10 : obj.cfg.brakeWidth
-                                        cfgBrakeOverrun = obj.cfg.brakeOverrun === undefined ? 0.12 : obj.cfg.brakeOverrun
+                                        cfgBrakeDep = obj.cfg.brakeDep === undefined ? 0.0 : obj.cfg.brakeDep
+                                        cfgRevCoupling = obj.cfg.revCoupling === undefined ? 1000 : obj.cfg.revCoupling
+                                        cfgRevWidth = obj.cfg.revWidth === undefined ? 100 : obj.cfg.revWidth
+                                        cfgRevOverrun = obj.cfg.revOverrun === undefined ? 120 : obj.cfg.revOverrun
                                         cfgBrakeCurve = obj.cfg.brakeCurve === undefined ? 0 : obj.cfg.brakeCurve
                                     }
                                     regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()

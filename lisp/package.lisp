@@ -27,10 +27,13 @@
 ; Brake half generator - see gen-brake-map in map.lisp.
 (define cfg-brake-str 1.0)
 (define cfg-brake-resp 1.0)
-(define cfg-brake-coupling 1.0)
-(define cfg-brake-width 0.10)
-(define cfg-brake-overrun 0.12)
+(define cfg-brake-dep 0.0)
 (define cfg-brake-curve 0)
+; Reverse limiter - fixed point (x1000), because unlike the generator
+; parameters these are read by the control loop on every braking tick.
+(define cfg-rev-coupling 1000)
+(define cfg-rev-width 100)
+(define cfg-rev-overrun 120)
 (define live-throttle 0)
 (define live-duty 0)
 (define live-cur-rel 0)
@@ -39,9 +42,28 @@
 (define brake-stopped nil)
 ; One buffer per owner: telemetry never shares its buffer with the event task.
 (define row-packet (array-create 24))
-(define cfg-packet (array-create 42))
+(define cfg-packet (array-create 44))
 
 @const-start
+; How far back a lever position may drive, applied on top of the brake
+; cells and only while genuinely travelling backwards. Separate from the
+; map on purpose: the cells shape braking against forward speed, which is
+; what riding uses, and reverse is a low-speed manoeuvre with its own
+; three numbers. All fixed point, no float in the loop.
+(defun brake-reverse (base lever rev)
+    (let ((balance (clamp-f (/ (* lever cfg-rev-coupling) 1000) 0 1000))
+          (start (max-f 0 (- balance cfg-rev-width))))
+        (cond
+            ((<= rev start) base)
+            ; Fading the demand out as the balance speed approaches.
+            ((<= rev balance)
+                (let ((p (/ (* (- rev start) 1000) (max-f 1 (- balance start)))))
+                    (/ (* base (- 1000 (/ (* p p) 1000))) 1000)))
+            ; Past it: forward torque, which slows a runaway reverse.
+            (t
+                (let ((over (/ (* (- rev balance) 1000) (max-f 1 (- 1000 balance)))))
+                    (/ (* cfg-rev-overrun (/ (* over over) 1000)) 1000))))))
+
 ; Lever braking only. Engine braking and overrun regen always stay pure
 ; regen: a bidirectional brake type must never reverse a released vehicle.
 (defun brake-apply (mag)
@@ -83,15 +105,14 @@
                             (if lever
                                 (if (= cfg-brake-map 0)
                                     (- live-brake)
-                                    ; The brake rows' duty axis is reverse
-                                    ; duty: travelling forwards clamps to
-                                    ; column 0, which holds the full demand,
-                                    ; so the lever brakes at full strength.
-                                    ; Only a bidirectional brake can climb
-                                    ; that axis and be limited by it.
-                                    (map-lookup (- live-brake)
-                                        (if (= cfg-brake-type 2)
-                                            (clamp-f (- live-duty) 0 1000) 0)))
+                                    ; Cells give braking against speed; the
+                                    ; reverse limiter only engages once
+                                    ; actually rolling backwards, which only
+                                    ; a bidirectional brake can do.
+                                    (let ((base (map-lookup (- live-brake) (abs live-duty))))
+                                        (if (and (= cfg-brake-type 2) (< live-duty 0))
+                                            (brake-reverse base live-brake (- live-duty))
+                                            base)))
                                 (map-lookup live-throttle (abs live-duty)))))
                     ; Negative map values mean braking, not reverse propulsion.
                     (if (< live-cur-rel 0)
@@ -154,10 +175,11 @@
         (bufset-i16 b 29 cfg-rev-erpm)
         (bufset-i16 b 31 (fx-enc cfg-brake-str))
         (bufset-i16 b 33 (fx-enc cfg-brake-resp))
-        (bufset-i16 b 35 (fx-enc cfg-brake-coupling))
-        (bufset-i16 b 37 (fx-enc cfg-brake-width))
-        (bufset-i16 b 39 (fx-enc cfg-brake-overrun))
-        (bufset-u8 b 41 cfg-brake-curve)
+        (bufset-i16 b 35 (fx-enc cfg-brake-dep))
+        (bufset-u8 b 37 cfg-brake-curve)
+        (bufset-i16 b 38 cfg-rev-coupling)
+        (bufset-i16 b 40 cfg-rev-width)
+        (bufset-i16 b 42 cfg-rev-overrun)
         (proto-send b))))
 
 (defun packet-valid (data)
@@ -177,7 +199,7 @@
                                         (setq ok nil)))
                                 ok))))
                     ((= cmd pkt-set-config)
-                        (and (= n 33) (<= (bufget-u8 data 1) 4)
+                        (and (= n 35) (<= (bufget-u8 data 1) 4)
                              (in-range (bufget-i16 data 2) 300 2000)
                              (in-range (bufget-i16 data 4) 0 1500)
                              (in-range (bufget-i16 data 6) 20 300)
@@ -192,11 +214,12 @@
                              (in-range (bufget-i16 data 19) 0 20000)
                              (in-range (bufget-i16 data 21) 0 1000)
                              (in-range (bufget-i16 data 23) 300 2000)
-                             (in-range (bufget-i16 data 25) 0 1500)
-                             (in-range (bufget-i16 data 27) 20 300)
-                             (in-range (bufget-i16 data 29) 0 500)
-                             (<= (bufget-u8 data 31) 3)
-                             (<= (bufget-u8 data 32) 1)))
+                             (in-range (bufget-i16 data 25) 0 1000)
+                             (<= (bufget-u8 data 27) 3)
+                             (<= (bufget-u8 data 28) 1)
+                             (in-range (bufget-i16 data 29) 0 1500)
+                             (in-range (bufget-i16 data 31) 20 300)
+                             (in-range (bufget-i16 data 33) 0 500)))
                     ((= cmd pkt-set-thr)
                         (and (= n 12) (<= (bufget-u8 data 1) 3)
                              (<= (bufget-u8 data 2) 1)
@@ -234,18 +257,19 @@
                     (setq cfg-rev-erpm (bufget-i16 data 19))
                     (setq cfg-brake-str (fx-dec (bufget-i16 data 21)))
                     (setq cfg-brake-resp (fx-dec (bufget-i16 data 23)))
-                    (setq cfg-brake-coupling (fx-dec (bufget-i16 data 25)))
-                    (setq cfg-brake-width (fx-dec (bufget-i16 data 27)))
-                    (setq cfg-brake-overrun (fx-dec (bufget-i16 data 29)))
-                    (setq cfg-brake-curve (bufget-u8 data 31))
+                    (setq cfg-brake-dep (fx-dec (bufget-i16 data 25)))
+                    (setq cfg-brake-curve (bufget-u8 data 27))
+                    (setq cfg-rev-coupling (bufget-i16 data 29))
+                    (setq cfg-rev-width (bufget-i16 data 31))
+                    (setq cfg-rev-overrun (bufget-i16 data 33))
                     ; Each half regenerates on its own flag: a traction
                     ; slider never rewrites brake rows, and vice versa.
                     (if (= (bufget-u8 data 16) 1)
                         (gen-thermal-map cfg-torque-resp cfg-speed-coupling cfg-trans-width
                             cfg-trans-shape cfg-high-hold cfg-engine-brake cfg-overrun-regen cfg-regen-curve))
-                    (if (= (bufget-u8 data 32) 1)
-                        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-coupling
-                            cfg-brake-width cfg-brake-overrun cfg-brake-curve))))
+                    (if (= (bufget-u8 data 28) 1)
+                        (gen-brake-map cfg-brake-str cfg-brake-resp
+                            cfg-brake-dep cfg-brake-curve))))
             ((= cmd pkt-set-thr)
                 (progn
                     (setq thr-cfg-source (bufget-u8 data 1))
