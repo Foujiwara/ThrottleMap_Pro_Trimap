@@ -1,8 +1,11 @@
+// Runs the real JavaScript out of ui.qml.in, with only Qt and the transport
+// mocked. It covers the receive path and the command queue - which is where
+// every interface bug in this project has actually been - and deliberately
+// not rendering or layout.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 const source=fs.readFileSync('ui.qml.in','utf8');
-// Execute the actual QML JavaScript functions, with only Qt/transport mocked.
 function extract(name) {
  const at=source.indexOf(`function ${name}(`); assert(at>=0,name);
  const start=source.indexOf('{',at);let depth=1,i=start+1,quote=null,comment=null;
@@ -19,45 +22,128 @@ function extract(name) {
  assert.equal(depth,0,name);return source.slice(at,i);
 }
 const sent=[];
-const state={console,ArrayBuffer,DataView,Date,Math,isFinite,Error,
+const timeout={interval:20000,restart(){},stop(){}};
+const noDebounce={running:false,stop(){}};
+const state={console,ArrayBuffer,DataView,Date,Math,Array,isFinite,Error,
  VescIf:{isPortConnected:()=>true},vescCommands:{sendCustomAppData:b=>sent.push(new Uint8Array(b))},
- commandTimeout:{restart(){},stop(){}},regenDebounce:{running:false,stop(){}},
+ commandTimeout:timeout,regenDebounce:noDebounce,brakeRegenDebounce:noDebounce,revRegenDebounce:noDebounce,
+ // Geometry: the ragged grid. 11 brake rows of 21 columns, 20 throttle rows
+ // of 11, sharing one flat buffer.
+ mapThrN:31,mapDutyN:21,mapThrZero:10,mapCells:451,mapData:Array(451).fill(0),
  cfgPreset:1,cfgTorqueResp:0.85,cfgSpeedCoupling:1,cfgTransWidth:0.1,cfgTransShape:1,
  cfgHighHold:0.55,cfgEngineBrake:0.15,cfgOverrunRegen:0.12,cfgRegenCurve:1,
- thrSource:0,thrInvert:0,thrMin:0.02,thrMax:0.98,thrDeadband:0.02,thrFilter:1,thrBrakeMode:2,
- mapN:21,mapData:Array(441).fill(0),txQueue:[],pendingPacket:null,mapReceived:true,cfgReceived:true,
- receivedRows:0,lastLiveTime:0,lastCmdStatus:'',benchValue:0,
+ cfgBrakeMap:0,cfgBrakeType:0,cfgDutyFilter:0.3,
+ cfgBrakeStr:1,cfgBrakeResp:1,cfgBrakeDep:0,cfgBrakeCurve:0,
+ cfgRevStr:1,cfgRevResp:1,cfgRevHold:0,cfgRevCoupling:1,cfgRevWidth:0.1,
+ cfgRevShape:1,cfgRevOverrun:0.12,cfgRevCurve:1,
+ thrSource:0,thrInvert:0,thrDeadband:0.02,thrFilter:1,thrBrakeMode:0,thrBidirCenter:1.65,
+ txQueue:[],pendingPacket:null,mapReceived:true,cfgReceived:true,rowSeen:[],
+ lastLiveTime:0,lastAutoReq:0,lastCmdStatus:'',statusText:'',benchValue:0,
+ liveThrottle:0,liveDuty:0,liveErpm:0,liveCurRel:0,liveCurA:0,liveBrake:0,
+ liveAdcVoltage:0,liveRpmFast:0,pkgEnabled:1,lockState:0,lockReason:0,lockErr:0,
+ scriptBooting:false,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
  cmdSetCell:1,cmdSetMapRow:2,cmdSetConfig:3,cmdSetThr:4,cmdSave:5,cmdLoad:6,cmdReset:7,
- cmdReqMap:8,cmdReqCfg:9,cmdSetTestThr:10,rxLive:128,rxMapRow:129,rxStatus:130,rxCfgEcho:131};
+ cmdReqMap:8,cmdReqCfg:9,cmdSetTestThr:10,cmdCalibrateBidir:11,cmdSetEnabled:12,
+ cmdSetLock:13,cmdLockCmd:14,rxLive:128,rxMapRow:129,rxStatus:130,rxCfgEcho:131};
 vm.createContext(state);
-for(const name of ['validateImport','quantizeCell','cellIdx','getCell','fxEnc','fxDec','i16Bytes','transmitPacket',
- 'sendPacket','pumpTx','failTransfer','sendSetCell','sendSetMapRow','sendAllRows','sendSetConfig','sendSetThrottle',
- 'sendSave','sendLoad','sendReset','requestMap','requestCfg','sendTestThrottle','handleRx','thermalPeak','shapeCurve','regenerateLocalMap']) {
+for(const name of ['validateImport','quantizeCell','mapRowCols','cellIdx','getCell','fxEnc','fxDec',
+ 'i16Bytes','transmitPacket','sendPacket','pumpTx','failTransfer','sendSetCell','sendSetMapRow',
+ 'sendAllRows','sendSetConfig','sendSetThrottle','sendLockCfg','sendSave','sendLoad','sendReset',
+ 'requestMap','requestCfg','sendTestThrottle','handleRx','thermalPeak','shapeCurve',
+ 'regenerateLocalMap','regenerateLocalBrake','regenerateLocalRev']) {
  vm.runInContext(extract(name),state);
 }
 function ack(code=0){state.handleRx(Uint8Array.from([130,code,state.pendingPacket[0]]).buffer);}
-state.sendAllRows();assert.equal(sent.length,1);assert.equal(state.txQueue.length,20);
-for(let i=0;i<21;i++)ack();assert.equal(sent.length,21);assert.equal(state.pendingPacket,null);
-sent.length=0;state.sendSetConfig();assert.equal(sent[0].length,17);assert.equal(sent[0][16],1);ack();
-state.sendSetConfig(false);assert.equal(sent.at(-1)[16],0);ack();
-state.cfgSpeedCoupling=0;state.cfgTorqueResp=1;state.regenerateLocalMap();
-assert.equal(state.mapData[10*21+20],0.5);assert.equal(state.mapData[20*21+20],1);
-// Save uploads all displayed parameters and cells before the flash command.
+function livePacket({booting=false,lockOn=false,reason=0,enabled=1}={}) {
+ const b=new Uint8Array(23);const v=new DataView(b.buffer);
+ b[0]=128;v.setUint8(17,enabled);
+ v.setUint8(18,(lockOn?1:0)+(reason<<4)+(booting?128:0));
+ return b.buffer;
+}
+
+// ---- the command queue ---------------------------------------------------
+// One acknowledged command at a time, and all 31 rows of the ragged grid.
+state.sendAllRows();assert.equal(sent.length,1);assert.equal(state.txQueue.length,30);
+for(let i=0;i<31;i++)ack();assert.equal(sent.length,31);assert.equal(state.pendingPacket,null);
+
+// The configuration packet is 44 bytes, with three independent regenerate
+// flags so one half of the map never rewrites another.
+sent.length=0;state.sendSetConfig();assert.equal(sent[0].length,44);
+assert.equal(sent[0][16],1);assert.equal(sent[0][28],0);assert.equal(sent[0][43],0);ack();
+state.sendSetConfig(false,true,true);
+assert.equal(sent.at(-1)[16],0);assert.equal(sent.at(-1)[28],1);assert.equal(sent.at(-1)[43],1);ack();
+
+// Save uploads every displayed parameter and all rows before the flash
+// command, and never regenerates on the way.
 sent.length=0;state.sendSave();while(state.pendingPacket!==null)ack(state.pendingPacket[0]===5?1:0);
-assert.deepEqual(sent.map(b=>b[0]),[3,4,...Array(21).fill(2),5]);assert.equal(sent[0][16],0);
+assert.deepEqual(sent.map(b=>b[0]),[3,4,...Array(31).fill(2),5]);assert.equal(sent[0][16],0);
 assert.match(state.lastCmdStatus,/verified/);
 sent.length=0;state.sendSave();ack(6);assert.equal(state.txQueue.length,0);assert.equal(sent.length,1);
 assert.match(state.lastCmdStatus,/Invalid/);
-// Neither side should throw when custom data belongs to another package.
+
+// The lock packet is 10 bytes: timeout, travel, ceiling, damping, dead travel.
+sent.length=0;state.pendingPacket=null;state.txQueue=[];
+state.sendLockCfg();assert.equal(sent[0].length,10);assert.equal(sent[0][1],60);ack();
+
+// ---- read-back timeouts --------------------------------------------------
+// A read-back is 31 packets and ~150 ms of pacing. Waiting 20 s to notice it
+// was dropped is what made a cold start look like a hang; only the EEPROM
+// operations need that long.
+state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];
+state.requestMap();assert.equal(timeout.interval,3000);ack();
+state.requestCfg();assert.equal(timeout.interval,3000);
+state.handleRx(Uint8Array.from([131,...Array(51).fill(0)]).buffer);ack();
+state.sendSave();assert.equal(timeout.interval,20000);
+state.failTransfer('reset');
+
+// ---- the receive path ----------------------------------------------------
+// Decode must happen before any early return. A "still starting" guard placed
+// above the decode latched the whole interface on the first packet it saw:
+// the value it tests is set BY the decode it skipped.
+state.scriptBooting=false;state.lastAutoReq=0;
+state.handleRx(livePacket({booting:true}));
+assert.equal(state.scriptBooting,true);
+assert.equal(state.statusText,'Connected','telemetry must decode while booting');
+state.handleRx(livePacket({booting:false,lockOn:true,reason:3}));
+assert.equal(state.scriptBooting,false,'the boot flag must be able to clear');
+assert.equal(state.lockState,1);assert.equal(state.lockReason,3);
+
+// The automatic read-back retry is rate limited. Unthrottled it re-queued all
+// 31 rows twenty times a second and took the link down with it.
+state.mapReceived=false;state.cfgReceived=false;
+state.pendingPacket=null;state.txQueue=[];state.lastAutoReq=0;
+state.handleRx(livePacket());
+const queuedAfterFirst=state.txQueue.length+(state.pendingPacket?1:0);
+assert.ok(queuedAfterFirst>0,'a read-back should be queued');
+state.pendingPacket=null;state.txQueue=[];
+state.handleRx(livePacket());
+assert.equal(state.txQueue.length+(state.pendingPacket?1:0),0,'retry must be rate limited');
+
+// Nothing is requested at all while the script is still starting.
+state.lastAutoReq=0;state.pendingPacket=null;state.txQueue=[];
+state.handleRx(livePacket({booting:true}));
+assert.equal(state.txQueue.length+(state.pendingPacket?1:0),0,'no requests while booting');
+state.scriptBooting=false;state.mapReceived=true;state.cfgReceived=true;
+
+// Neither side may throw on data belonging to another package.
 for(const id of [128,129,130,131]) for(let n=0;n<2;n++) {
  const b=new Uint8Array(n);if(n)b[0]=id;assert.doesNotThrow(()=>state.handleRx(b.buffer));
 }
+// A row index outside the grid is ignored rather than growing the buffer.
 const outOfBounds=new Uint8Array(44);outOfBounds[0]=129;outOfBounds[1]=255;
-state.handleRx(outOfBounds.buffer);assert.equal(state.mapData.length,441);
-assert.throws(()=>state.validateImport({map:Array(441).fill(NaN)}));
-assert.throws(()=>state.validateImport({map:Array(440).fill(0)}));
-assert.throws(()=>state.validateImport({map:Array(441).fill(0),cfg:{preset:1}}));
-assert.doesNotThrow(()=>state.validateImport({map:Array(441).fill(-0.5)}));
-state.pendingPacket=null;state.txQueue=[];state.requestMap();ack();assert.equal(state.mapReceived,false);
+state.handleRx(outOfBounds.buffer);assert.equal(state.mapData.length,451);
+// A brake row carries 21 columns, a throttle row 11, into the same buffer.
+assert.equal(state.mapRowCols(0),21);assert.equal(state.mapRowCols(30),11);
+assert.equal(state.cellIdx(0,0),0);assert.equal(state.cellIdx(30,10),450);
+
+// ---- import validation ---------------------------------------------------
+assert.throws(()=>state.validateImport({map:Array(451).fill(NaN)}));
+assert.throws(()=>state.validateImport({map:Array(450).fill(0)}));
+assert.throws(()=>state.validateImport({map:Array(451).fill(0),cfg:{preset:1}}));
+assert.doesNotThrow(()=>state.validateImport({map:Array(451).fill(-0.5)}));
+
+// ---- incomplete read-back ------------------------------------------------
+state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];
+state.requestMap();ack();assert.equal(state.mapReceived,false);
 assert.match(state.lastCmdStatus,/Incomplete/);
 console.log('QML JavaScript regression tests passed');

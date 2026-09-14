@@ -219,7 +219,11 @@
                 (let ((e (lock-load)))
                     (progn
                         (setq live-cur-rel
-                            (if (= e 0)
+                            ; Inside a real dead travel, nothing at all. With
+                            ; no dead travel, e is zero only at the exact
+                            ; centre - which is precisely where the damper
+                            ; has to keep working, or it rings through it.
+                            (if (and (> lock-dead 0) (= e 0))
                                 0
                                 (let ((p (clamp-f (/ (* e 1000) lock-span)
                                                   -1000 1000))
@@ -518,6 +522,9 @@
             (_ nil))))
 @const-end
 
+; ---- boot ----
+; The test harness cuts the file here: everything below spawns threads or
+; touches hardware, and the suite drives control-tick itself.
 ; Threads first, configuration second. Generating the default map is
 ; hundreds of interpreted float operations across 451 cells; run before the
 ; threads exist, the interface gets no telemetry and no answer to anything
