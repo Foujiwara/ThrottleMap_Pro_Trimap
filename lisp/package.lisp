@@ -43,10 +43,7 @@
 ; Duty is the variable the map closes its loop on, so it needs filtering at
 ; least as much as the throttle does. 1000 = unfiltered.
 (define cfg-duty-filter 300)
-; Milliseconds for the output to travel full scale. 0 = no limit.
-(define cfg-slew-ms 150)
 (define duty-filt-acc 0)
-(define live-cmd 0)
 (define live-throttle 0)
 (define live-duty 0)
 (define live-cur-rel 0)
@@ -101,20 +98,10 @@
                        (- (/ (* cfg-duty-filter (mod duty-filt-acc 1000)) 1000))))
                 (/ duty-filt-acc 1000)))))
 
-; Rate limit on the command itself. The VESC's own apps ramp their output;
-; ours bypasses that entirely because their control type is Off, so without
-; this every step in the map leaves as an instant torque step.
-(defun slew-step (cur target)
-    (if (= cfg-slew-ms 0)
-        target
-        (let ((step (max-f 1 (/ 5000 cfg-slew-ms))))
-            (if (> target (+ cur step))
-                (+ cur step)
-                (if (< target (- cur step)) (- cur step) target)))))
 
 (defun control-tick ()
     (if storage-busy
-        (progn (setq live-cur-rel 0) (setq live-cmd 0) (setq duty-filt-acc 0))
+        (progn (setq live-cur-rel 0) (setq duty-filt-acc 0))
         (progn
             (setq live-throttle (thr-read))
             (setq live-brake (thr-brake-read))
@@ -134,10 +121,10 @@
                                     (let ((v (map-lookup (- live-brake) live-duty)))
                                         (if (= cfg-brake-type 2) v (min-f v 0))))
                                 (map-lookup live-throttle live-duty))))
-                    ; A lost input must cut instantly, never ramp down.
-                    (setq live-cmd
-                        (if thr-expired 0 (slew-step live-cmd live-cur-rel)))
-                    (apply-output live-cmd))))))
+                    ; Straight through, on purpose: the map is the torque
+                    ; request, and smoothing it would blunt the very thing
+                    ; the cells are there to define.
+                    (apply-output live-cur-rel))))))
 
 (defun control-loop ()
     (loopwhile t (progn (control-tick) (sleep 0.005))))
@@ -188,7 +175,7 @@
         (bufset-u8 b 16 thr-cfg-source)
         (bufset-u8 b 17 thr-cfg-invert)
         (bufset-i16 b 18 cfg-duty-filter)
-        (bufset-i16 b 20 cfg-slew-ms)
+        (bufset-i16 b 20 0)
         (bufset-i16 b 22 thr-cfg-deadband)
         (bufset-i16 b 24 thr-cfg-filter)
         (bufset-u8 b 26 thr-cfg-brake-mode)
@@ -257,7 +244,7 @@
                         (and (= n 12) (<= (bufget-u8 data 1) 3)
                              (<= (bufget-u8 data 2) 1)
                              (in-range (bufget-i16 data 3) 1 1000)
-                             (in-range (bufget-i16 data 5) 0 2000)
+                             (in-range (bufget-i16 data 5) 0 2000)  ; reserved
                              (in-range (bufget-i16 data 7) 0 999)
                              (in-range (bufget-i16 data 9) 1 1000)
                              (<= (bufget-u8 data 11) 2)))
@@ -311,7 +298,7 @@
                     (setq thr-cfg-source (bufget-u8 data 1))
                     (setq thr-cfg-invert (bufget-u8 data 2))
                     (setq cfg-duty-filter (bufget-i16 data 3))
-                    (setq cfg-slew-ms (bufget-i16 data 5))
+                    ; data 5 is reserved (retired output ramp).
                     (setq thr-cfg-deadband (bufget-i16 data 7))
                     (setq thr-cfg-filter (bufget-i16 data 9))
                     (setq thr-cfg-brake-mode (bufget-u8 data 11))
