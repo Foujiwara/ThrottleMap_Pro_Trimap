@@ -105,21 +105,14 @@
                         (+ 1.0 curve))))))))))
 
 (defun gen-thermal-map (response coupling width shape hold brake overrun curve)
-    (progn
-        (looprange ti 0 21
-            (let ((thr (/ ti 20.0))
-                  (peak (thermal-peak thr response hold))
-                  (balance (clamp01 (* thr coupling))))
-                (looprange di 0 11
-                    (map-set-cell (+ ti 10) (if (= ti 0) (+ di 10) di)
-                        (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
-                                            width shape brake overrun curve))))))
-        ; Released row, negative duty: engine braking while rolling
-        ; backwards. Seeded as the mirror, editable on its own from there.
-        (looprange di 0 10
-            (map-set-cell 10 di
-                (to-fp (thermal-cell 0.0 (/ (- 10 di) 10.0) 0.0 0.0 coupling
-                                    width shape brake overrun curve))))))
+    (looprange ti 0 21
+        (let ((thr (/ ti 20.0))
+              (peak (thermal-peak thr response hold))
+              (balance (clamp01 (* thr coupling))))
+            (looprange di 0 11
+                (map-set-cell (+ ti 10) (if (= ti 0) (+ di 10) di)
+                    (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
+                                        width shape brake overrun curve)))))))
 
 ; Brake rows split into their two halves, each with its own regenerate
 ; flag so shaping one never discards hand edits made to the other. Both
@@ -140,7 +133,7 @@
 
 ; Left half (duty <= 0): reverse, which is the traction law negated - same
 ; peak/balance/taper/overrun shape, its own eight settings.
-(defun gen-rev-half ()
+(defun gen-rev-rows ()
     (looprange bi 0 10
         (let ((b (/ (- 10 bi) 10.0)))
             (let ((peak (* cfg-rev-str (thermal-peak b cfg-rev-resp cfg-rev-hold)))
@@ -151,4 +144,16 @@
                             (to-fp (- (thermal-cell b rev peak balance
                                         cfg-rev-coupling cfg-rev-width cfg-rev-shape
                                         0.0 cfg-rev-overrun cfg-rev-curve))))))))))
+(defun gen-rev-half ()
+    (progn
+        (gen-rev-rows)
+        ; Row 10 is the seam of this region: the lever is zero there, so no
+        ; reverse setting applies. What is left is engine braking against
+        ; the backwards roll - negative, so it brakes rather than driving.
+        (looprange di 0 10
+            (map-set-cell 10 di
+                (to-fp (- (* cfg-engine-brake
+                             (pow (/ (- 10 di) 10.0)
+                                  (+ 1.0 cfg-regen-curve)))))))))
+
 @const-end
