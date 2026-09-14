@@ -34,6 +34,27 @@ def tokenize(s):
         toks.append(('atom', s[i:j], line)); i = j
     return toks
 
+def balance(path, toks):
+    """Parenthesis balance, per file.
+
+    The body-arity walk below parses forms and would happily accept a stray
+    closer by ending one form early, so the cheap check has to come first
+    and has to be its own pass.
+    """
+    d = 0
+    for kind, _text, line in toks:
+        if kind == '(':
+            d += 1
+        elif kind == ')':
+            d -= 1
+            if d < 0:
+                print("%s:%d  unbalanced: a closing paren with nothing open" % (path, line))
+                return False
+    if d != 0:
+        print("%s: unbalanced: %d form(s) left open at end of file" % (path, d))
+        return False
+    return True
+
 def parse(toks):
     pos = [0]
     def rd():
@@ -83,7 +104,11 @@ for p in ['lisp/package.lisp','lisp/map.lisp','lisp/storage.lisp',
     s = io.open(p, encoding='utf-8').read()
     s = s.replace('@const-start','').replace('@const-end','')
     bad = []
-    for form in parse(tokenize(s)):
+    toks = tokenize(s)
+    if not balance(p, toks):
+        failed = True
+        continue
+    for form in parse(toks):
         walk(form, p)
     if bad:
         failed = True

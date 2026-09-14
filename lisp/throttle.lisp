@@ -13,6 +13,15 @@
 (define thr-adc-cal-end 0)
 (define thr-adc-cal-loaded nil)
 (define thr-bidir-center 1650)
+; Set when the bidirectional input reads outside its calibrated band. A
+; centre-resting input has no safe failure value: a broken signal wire sits
+; near 0 V, which is a full reverse request and is indistinguishable from a
+; deliberate one without this test.
+(define thr-adc-fault nil)
+; Brake channel filter state. The throttle has always been smoothed; the
+; dual-ADC brake was raw ADC straight into the map.
+(define thr-brake-acc 0)
+(define thr-brake-filtered 0)
 (define uart-buf (array-create 3))
 (define uart-started nil)
 (define uart-pos 0)
@@ -38,6 +47,9 @@
         (setq thr-test-value 0)
         (setq uart-last-raw 0)
         (setq uart-pos 0)
+        (setq thr-brake-acc 0)
+        (setq thr-brake-filtered 0)
+        (setq thr-adc-fault nil)
         (setq thr-adc-cal-loaded nil)))
 
 (defun thr-adc-cal-ensure ()
@@ -53,7 +65,16 @@
     (progn
         (thr-adc-cal-ensure)
         (let ((dir (if (> thr-adc-cal-end thr-adc-cal-start) 1 -1))
-              (raw (to-fp (get-adc 0))))
+              (raw (to-fp (get-adc 0)))
+              (lo (min-f thr-adc-cal-start thr-adc-cal-end))
+              (hi (max-f thr-adc-cal-start thr-adc-cal-end)))
+            (progn
+            ; Only meaningful once the band is plausibly calibrated: a start
+            ; at 0 V cannot be told apart from a dead wire.
+            (setq thr-adc-fault
+                (and (> lo 150)
+                     (or (< raw (- lo 150)) (> raw (+ hi 150)))))
+            (if thr-adc-fault 0
             (let ((delta (* (- raw thr-bidir-center) dir))
                   (pos-span (* (- thr-adc-cal-end thr-bidir-center) dir))
                   (neg-span (* (- thr-bidir-center thr-adc-cal-start) dir)))
@@ -65,7 +86,7 @@
                     (if (<= mag thr-cfg-deadband) 0
                         (* (if (< v 0) -1 1)
                            (/ (* (- mag thr-cfg-deadband) 1000)
-                              (- 1000 thr-cfg-deadband))))))))))
+                              (- 1000 thr-cfg-deadband))))))))))))
 
 ; Captures only the neutral point of the bidirectional input. Start/end stay
 ; owned by VESC Tool's ADC calibration.
@@ -121,7 +142,10 @@
         (thr-deadband (if (= thr-cfg-invert 1) (- 1000 v) v))))
 
 (defun thr-input-expired ()
-    (or (and (= thr-cfg-source thr-src-test) (> (secs-since thr-test-time) 0.5))
+    (or (and (= thr-cfg-source thr-src-adc)
+             (= thr-cfg-brake-mode thr-brake-bidir)
+             thr-adc-fault)
+        (and (= thr-cfg-source thr-src-test) (> (secs-since thr-test-time) 0.5))
         (and (= thr-cfg-source thr-src-ppm) (> (get-ppm-age) 0.5))
         (and (= thr-cfg-source thr-src-uart) (> (secs-since uart-last-time) 0.5))))
 
@@ -142,13 +166,32 @@
                 (setq thr-filtered (/ thr-filter-acc 1000))))
         (max-f 0 thr-filtered))))
 
+; The dual-ADC brake gets the same smoothing as the throttle. It used to go
+; from raw ADC straight into the map, so the two channels of the same pair
+; of hall grips behaved completely differently: the throttle was filtered
+; and the brake passed its noise on to the current request unchanged.
+; Called exactly once per control tick, like thr-read.
+(defun thr-brake-filter (n)
+    (if thr-expired
+        (progn (setq thr-brake-acc 0) (setq thr-brake-filtered 0) 0)
+        (progn
+            ; Split product to stay below the 28-bit signed limit.
+            (setq thr-brake-acc
+                (+ thr-brake-acc
+                   (* thr-cfg-filter (- n (/ thr-brake-acc 1000)))
+                   (- (/ (* thr-cfg-filter (mod thr-brake-acc 1000)) 1000))))
+            (setq thr-brake-filtered (/ thr-brake-acc 1000))
+            (max-f 0 thr-brake-filtered))))
+
 (defun thr-brake-read ()
     (cond
         ; Bench source: a negative test value is a brake request.
         ((= thr-cfg-source thr-src-test) (max-f 0 (- thr-test-value)))
         ((not (= thr-cfg-source thr-src-adc)) 0)
         ((= thr-cfg-brake-mode thr-brake-dual)
-            (thr-deadband (to-fp (get-adc-decoded 1))))
+            (thr-brake-filter (thr-deadband (to-fp (get-adc-decoded 1)))))
+        ; Bidirectional takes the brake side off the already filtered signed
+        ; sample, so it needs no second filter.
         ((= thr-cfg-brake-mode thr-brake-bidir) (max-f 0 (- thr-filtered)))
         (t 0)))
 @const-end
