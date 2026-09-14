@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 16
+    property int buildMarker: 17
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -440,17 +440,11 @@ Item {
         if (cmd === rxLive) {
             if (view.byteLength !== 23) return
             lastLiveTime = Date.now()
-            if (!mapReceived && pendingPacket !== null && pendingPacket[0] === cmdReqMap) {
-                var seen = 0
-                for (var i = 0; i < mapThrN; i++) if (rowSeen[i]) seen++
-                lastCmdStatus = "Reading map: " + seen + "/" + mapThrN + " rows"
-            }
-            if (scriptBooting) { lastCmdStatus = "Package starting"; return }
-            if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0
-                    && Date.now() - lastAutoReq > 2000) {
-                lastAutoReq = Date.now()
-                requestCfg(); requestMap()
-            }
+            // Decode FIRST, decide after. Anything that returns early from
+            // up here also skips the decode that would have cleared the
+            // condition it returned on - which is how a "still starting"
+            // guard placed above this line latched the whole interface on
+            // the first packet it ever saw.
             liveThrottle = fxDec(view.getInt16(1, false))
             liveDuty = fxDec(view.getInt16(3, false))
             liveErpm = view.getInt32(5, false)
@@ -466,6 +460,18 @@ Item {
             lockErr = view.getInt16(19, false) / 1000.0
             liveRpmFast = view.getInt16(21, false)
             statusText = "Connected"
+
+            if (scriptBooting) { lastCmdStatus = "Package starting"; return }
+            if (!mapReceived && pendingPacket !== null && pendingPacket[0] === cmdReqMap) {
+                var seen = 0
+                for (var i = 0; i < mapThrN; i++) if (rowSeen[i]) seen++
+                lastCmdStatus = "Reading map: " + seen + "/" + mapThrN + " rows"
+            }
+            if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0
+                    && Date.now() - lastAutoReq > 2000) {
+                lastAutoReq = Date.now()
+                requestCfg(); requestMap()
+            }
         } else if (cmd === rxMapRow) {
             if (view.byteLength !== 44) return
             var row = view.getUint8(1)
