@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 7
+    property int buildMarker: 8
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -53,6 +53,9 @@ Item {
     readonly property int cmdReqCfg:     0x09
     readonly property int cmdSetTestThr: 0x0A
     readonly property int cmdCalibrateBidir: 0x0B
+    readonly property int cmdSetEnabled: 0x0C
+    readonly property int cmdSetLock:    0x0D
+    readonly property int cmdLockCmd:    0x0E
 
     readonly property int rxLive:    0x80
     readonly property int rxMapRow:  0x81
@@ -146,6 +149,16 @@ Item {
     property real liveCurA: 0
     property real liveBrake: 0
     property real liveAdcVoltage: 0
+    property int pkgEnabled: 1
+    property int lockState: 0
+    property real lockErr: 0        // mechanical revolutions of deflection
+    property real liveRpmFast: 0
+    // Lock settings live in RAM on the controller: the EEPROM is full, and
+    // the lock can only be engaged from here anyway.
+    property int lockPoles: 15
+    property real lockTravel: 0.25  // revolutions for full hold current
+    property real lockMax: 0.15     // hold current, relative
+    property real lockDamp: 0.30
     property string statusText: "Not connected"
     property string lastCmdStatus: "" // last SAVE/LOAD/RESET/REQUEST_* reply, see handleRx
 
@@ -274,6 +287,15 @@ Item {
         sendPacket(b)
     }
     function calibrateBidirectional() { sendPacket([cmdCalibrateBidir]) }
+    function sendEnabled(on) { sendPacket([cmdSetEnabled, on ? 1 : 0]) }
+    function sendLockCfg() {
+        var b = [cmdSetLock, lockPoles & 0xff]
+        b = b.concat(i16Bytes(Math.round(lockTravel * 1000)))
+        b = b.concat(i16Bytes(Math.round(lockMax * 1000)))
+        b = b.concat(i16Bytes(Math.round(lockDamp * 1000)))
+        sendPacket(b)
+    }
+    function sendLock(on) { sendPacket([cmdLockCmd, on ? 1 : 0]) }
     function sendSetMapRow(t) {
         var b = [cmdSetMapRow, t & 0xff]
         for (var d = 0; d < 21; d++)
@@ -402,7 +424,7 @@ Item {
         if (view.byteLength < 1) return
         var cmd = view.getUint8(0)
         if (cmd === rxLive) {
-            if (view.byteLength !== 17) return
+            if (view.byteLength !== 23) return
             lastLiveTime = Date.now()
             if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0) { requestMap(); requestCfg() }
             liveThrottle = fxDec(view.getInt16(1, false))
@@ -412,6 +434,10 @@ Item {
             liveCurA = view.getInt16(11, false) / 100.0
             liveBrake = fxDec(view.getInt16(13, false))
             liveAdcVoltage = view.getInt16(15, false) / 1000.0
+            pkgEnabled = view.getUint8(17)
+            lockState = view.getUint8(18)
+            lockErr = view.getInt16(19, false) / 1000.0
+            liveRpmFast = view.getInt16(21, false)
             statusText = "Connected"
         } else if (cmd === rxMapRow) {
             if (view.byteLength !== 44) return
@@ -729,6 +755,14 @@ Item {
                 // or a cache; this number tells them apart at a glance.
                 Label { text: "b" + buildMarker; color: "#f80"; font.bold: true }
                 Label {
+                    visible: pkgEnabled === 0
+                    text: "OFF"; color: "#ff5555"; font.bold: true
+                }
+                Label {
+                    visible: lockState === 1
+                    text: "LOCK"; color: "#00e5ff"; font.bold: true
+                }
+                Label {
                     font.pixelSize: 10; color: "#0f0"
                     Layout.maximumWidth: 160
                     elide: Text.ElideRight
@@ -749,6 +783,7 @@ Item {
                 TabButton { text: "Map" }
                 TabButton { text: "Curves" }
                 TabButton { text: "3D" }
+                TabButton { text: "Lock" }
                 TabButton { text: "Config" }
             }
 
@@ -769,6 +804,7 @@ Item {
                 Loader { sourceComponent: mapTabComponent }
                 Loader { sourceComponent: curvesTabComponent }
                 Loader { sourceComponent: iso3DTabComponent }
+                Loader { sourceComponent: lockTabComponent }
                 Loader { sourceComponent: configuratorTabComponent }
             }
         }
@@ -1983,6 +2019,189 @@ Item {
     // Tab: Configurator (presets + parametric map generation + throttle
     // source setup + save/load/reset + text export/import)
     // =================================================================
+    // =================================================================
+    // Tab: Lock - a position hold that behaves like a torsion spring
+    // =================================================================
+    Component {
+        id: lockTabComponent
+        Item {
+            id: lockTab
+            width: stackLayout.width
+            height: stackLayout.height
+
+            Flickable {
+                anchors.fill: parent
+                clip: true
+                contentWidth: width
+                contentHeight: lockCol.implicitHeight + 16
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn; width: 14 }
+                ColumnLayout {
+                    id: lockCol
+                    width: parent.width - 20
+                    spacing: 10
+
+                    Label { text: "Position lock"; font.bold: true; color: "#ddd" }
+                    Label {
+                        text: "Holds the machine in place without freezing it: it gives way under load, and pushes back harder the further it is moved. Position comes from integrating the motor speed, which your hall sensors keep updating at a standstill."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
+                    GridLayout {
+                        columns: 2
+                        Label { text: "State"; color: "#aaa" }
+                        Label {
+                            text: lockState === 1 ? "ENGAGED" : "released"
+                            color: lockState === 1 ? "#00e5ff" : "#888"; font.bold: true
+                        }
+                        Label { text: "Deflection"; color: "#aaa" }
+                        Label { text: lockErr.toFixed(3) + " turns"; color: "#fff" }
+                        Label { text: "Hold current"; color: "#aaa" }
+                        Label { text: (liveCurRel * 100).toFixed(1) + " %"; color: "#fff" }
+                        Label { text: "ERPM"; color: "#aaa" }
+                        Label { text: liveRpmFast.toFixed(0); color: "#fff" }
+                    }
+
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Button {
+                            text: "ENGAGE"
+                            enabled: lockState === 0 && pkgEnabled === 1
+                            onClicked: { sendLockCfg(); sendLock(true) }
+                        }
+                        Button {
+                            text: "RELEASE"
+                            Material.background: "#b23b3b"
+                            enabled: lockState === 1
+                            onClicked: sendLock(false)
+                        }
+                    }
+                    Label {
+                        text: "Engaging is refused unless the machine is stopped with nothing asked of it. Any throttle or brake input releases it immediately, and it releases itself after 60 seconds."
+                        color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    Label {
+                        text: "Holding current at a standstill puts all the heat into one or two phases with no cooling from rotation. Keep the ceiling low and do not treat this as a parking brake."
+                        color: "#ff9955"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+                    Label { text: "Settings"; font.bold: true; color: "#ddd" }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Tolerated travel (turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: lockTravel.toFixed(2)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0.02, 5.0)
+                                    if (v !== null) { lockTravel = v; sendLockCfg() }
+                                    text = Qt.binding(function() { return lockTravel.toFixed(2) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0.02; to: 2.0
+                            value: lockTravel
+                            onMoved: lockTravel = value
+                            onPressedChanged: if (!pressed) sendLockCfg()
+                        }
+                    }
+                    Label {
+                        text: "How far it may be pushed before the hold reaches its current ceiling. Smaller is stiffer."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Max hold current"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: lockMax.toFixed(2)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0.02, 0.50)
+                                    if (v !== null) { lockMax = v; sendLockCfg() }
+                                    text = Qt.binding(function() { return lockMax.toFixed(2) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0.02; to: 0.50
+                            value: lockMax
+                            onMoved: lockMax = value
+                            onPressedChanged: if (!pressed) sendLockCfg()
+                        }
+                    }
+                    Label {
+                        text: "Fraction of the configured motor current. This is the thermal ceiling - start low."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Damping"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: lockDamp.toFixed(2)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0.0, 1.0)
+                                    if (v !== null) { lockDamp = v; sendLockCfg() }
+                                    text = Qt.binding(function() { return lockDamp.toFixed(2) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0.0; to: 1.0
+                            value: lockDamp
+                            onMoved: lockDamp = value
+                            onPressedChanged: if (!pressed) sendLockCfg()
+                        }
+                    }
+                    Label {
+                        text: "Resists speed rather than position. Without it the spring rings - inertia overshoots every time. Tune it first, high, then lower it until it just stops bouncing."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Motor pole pairs"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: lockPoles.toFixed(0)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 1, 40)
+                                    if (v !== null) { lockPoles = Math.round(v); sendLockCfg() }
+                                    text = Qt.binding(function() { return lockPoles.toFixed(0) })
+                                }
+                            }
+                        }
+                    }
+                    Label {
+                        text: "Only converts the reading into real wheel turns - half the pole count in your motor configuration. Wrong here just rescales the numbers, it changes nothing about the hold."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Label {
+                        text: "Settings are not saved to EEPROM - the store is full. They are sent from here each time you engage, so keep VESC Tool connected while using the lock."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                }
+            }
+        }
+    }
+
     Component {
         id: configuratorTabComponent
         Item {
@@ -2008,6 +2227,22 @@ Item {
                     id: cfgCol
                     width: cfgFlick.width - 20
                     spacing: 10
+
+                    Label { text: "Package"; font.bold: true; color: "#ddd" }
+                    CheckBox {
+                        text: "Package enabled"
+                        checked: pkgEnabled === 1
+                        onToggled: { pkgEnabled = checked ? 1 : 0; sendEnabled(checked) }
+                    }
+                    Label {
+                        text: pkgEnabled === 1
+                            ? "Turn this off to hand the motor back without uninstalling: the package stops issuing any command at all, and the controller releases the motor on its own timeout. The setting is saved, so it survives a reboot."
+                            : "OFF - this package is commanding nothing. The controller has released the motor, and another app can drive it. Nothing here affects the motor until you switch it back on."
+                        color: pkgEnabled === 1 ? "#777" : "#ff9955"
+                        wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
 
                     Label {
                         text: "Preset and map-shaping sliders (Torque response, Speed coupling, " +
