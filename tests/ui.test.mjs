@@ -41,7 +41,7 @@ const state={console,ArrayBuffer,DataView,Date,Math,Array,isFinite,Error,
  lastLiveTime:0,lastAutoReq:0,lastCmdStatus:'',statusText:'',benchValue:0,
  liveThrottle:0,liveDuty:0,liveErpm:0,liveCurRel:0,liveCurA:0,liveBrake:0,
  liveAdcVoltage:0,liveRpmFast:0,pkgEnabled:1,lockState:0,lockReason:0,lockErr:0,
- scriptBooting:false,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
+ scriptBooting:false,autoLoadDone:false,autoLoadPending:false,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
  cmdSetCell:1,cmdSetMapRow:2,cmdSetConfig:3,cmdSetThr:4,cmdSave:5,cmdLoad:6,cmdReset:7,
  cmdReqMap:8,cmdReqCfg:9,cmdSetTestThr:10,cmdCalibrateBidir:11,cmdSetEnabled:12,
  cmdSetLock:13,cmdLockCmd:14,rxLive:128,rxMapRow:129,rxStatus:130,rxCfgEcho:131};
@@ -118,6 +118,24 @@ assert.ok(queuedAfterFirst>0,'a read-back should be queued');
 state.pendingPacket=null;state.txQueue=[];
 state.handleRx(livePacket());
 assert.equal(state.txQueue.length+(state.pendingPacket?1:0),0,'retry must be rate limited');
+
+// A fresh connection pulls the stored map out of EEPROM before reading it
+// back, so the graph shows what is saved and not whatever is in RAM.
+state.mapReceived=false;state.cfgReceived=false;
+state.autoLoadDone=false;state.autoLoadPending=false;
+state.pendingPacket=null;state.txQueue=[];state.lastAutoReq=0;
+state.handleRx(livePacket());
+assert.equal(state.pendingPacket[0],state.cmdLoad,'a connection loads from EEPROM first');
+assert.deepEqual(state.txQueue.map(b=>b[0]),[state.cmdReqCfg,state.cmdReqMap]);
+// A controller with nothing saved answers that load with an error. It is a
+// normal state on a fresh install, not a failed transfer, and the read-backs
+// queued behind it must still go out.
+ack(5);
+assert.equal(state.autoLoadDone,true);
+assert.match(state.lastCmdStatus,/Nothing saved/);
+assert.equal(state.pendingPacket[0],state.cmdReqCfg,'the read-back survives an empty EEPROM');
+state.pendingPacket=null;state.txQueue=[];
+state.mapReceived=true;state.cfgReceived=true;
 
 // Nothing is requested at all while the script is still starting.
 state.lastAutoReq=0;state.pendingPacket=null;state.txQueue=[];
