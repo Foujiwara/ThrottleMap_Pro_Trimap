@@ -190,6 +190,7 @@
         (let ((r (trap (lock-dist))))
             (if (eq (car r) 'exit-ok)
                 (progn (setq lock-reason 0)
+                       (setq duty-filt-acc 0)
                        (setq lock-mmrev (lock-scale))
                        (lock-set-span)
                        (setq lock-ref (car (cdr r)))
@@ -469,6 +470,9 @@
                     (setq thr-cfg-deadband (bufget-i16 data 7))
                     (setq thr-cfg-filter (bufget-i16 data 9))
                     (setq thr-cfg-brake-mode (bufget-u8 data 11))
+                    ; Re-read the ADC band: it is cached, and VESC Tool's
+                    ; own calibration can have changed since.
+                    (setq thr-adc-cal-loaded nil)
                     (thr-reset-state)))
             ((= cmd pkt-set-test-thr)
                 (progn

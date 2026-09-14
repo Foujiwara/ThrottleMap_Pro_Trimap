@@ -295,6 +295,54 @@
 (control-tick)
 (expect (= adc-reads 1) 'single-bidir-sample)
 
+; ---- input faults and the brake channel ----------------------------------
+; A bidirectional input rests at mid-scale, so there is no safe reading for a
+; broken signal wire: 0 V is a full reverse request and looks exactly like a
+; deliberate one. Anything outside the calibrated band is a fault, and the
+; whole chain has to go quiet - this used to command full reverse current.
+(storage-reset)
+(setq thr-cfg-source 0)
+(setq thr-cfg-brake-mode 2)
+(setq thr-cfg-filter 1000)
+(setq thr-cfg-deadband 20)
+(setq rpm-value 0.0)
+(setq adc-value 0.0)              ; wire off: 0 V against a 0.5-3.0 V band
+(looprange i 0 5 (thr-read))
+(expect (= (thr-read) 0) 'open-wire-no-throttle)
+(expect (= (thr-brake-read) 0) 'open-wire-no-brake)
+(expect thr-adc-fault 'open-wire-raises-the-fault)
+(control-tick)
+(expect (= live-cur-rel 0) 'open-wire-commands-nothing)
+(expect thr-expired 'open-wire-counts-as-expired)
+(setq adc-value 3.5)              ; above the band: a short to the rail
+(looprange i 0 5 (thr-read))
+(expect thr-adc-fault 'over-range-raises-the-fault)
+; Back inside the band and it recovers on its own.
+(setq adc-value 1.65)
+(looprange i 0 5 (thr-read))
+(expect (not thr-adc-fault) 'fault-clears-when-the-band-returns)
+(expect (not thr-expired) 'expiry-clears-with-it)
+
+; The dual-ADC brake is filtered exactly like the throttle. It used to go
+; from raw ADC straight into the map, so one grip was smoothed and the other
+; handed its noise directly to the current request.
+(setq thr-cfg-brake-mode 1)
+(setq thr-cfg-filter 100)
+(setq adc-value 0.0)
+(setq brake-value 0.0)
+(looprange i 0 60 (progn (thr-read) (thr-brake-read)))
+(expect (= (thr-brake-read) 0) 'brake-settles-to-zero)
+(setq brake-value 1.0)            ; slammed to full in one tick
+(thr-read)
+(expect (< (thr-brake-read) 250) 'brake-is-filtered-not-instant)
+(looprange i 0 100 (progn (thr-read) (thr-brake-read)))
+(expect (> (thr-brake-read) 900) 'brake-still-reaches-full)
+(setq brake-value 0.0)
+(looprange i 0 200 (progn (thr-read) (thr-brake-read)))
+(expect (= (thr-brake-read) 0) 'brake-filter-settles-back-to-zero)
+(setq thr-cfg-filter 1000)
+(setq thr-cfg-brake-mode 0)
+
 ; ---- brake routing -------------------------------------------------------
 ; Braking is torque against the way the machine is actually moving. A reverse
 ; request from a standstill is propulsion and must leave as current even in
