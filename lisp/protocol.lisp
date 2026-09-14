@@ -13,6 +13,9 @@
 (define pkt-req-cfg     0x09)
 (define pkt-set-test-thr 0x0A)
 (define pkt-calibrate-bidir 0x0B)
+(define pkt-set-enabled 0x0C)
+(define pkt-set-lock    0x0D)
+(define pkt-lock-cmd    0x0E)
 
 (define pkt-live        0x80)
 (define pkt-map-row     0x81)

@@ -44,6 +44,20 @@
 ; least as much as the throttle does. 1000 = unfiltered.
 (define cfg-duty-filter 300)
 (define duty-filt-acc 0)
+; Master switch. Disabled means this package issues no motor command at all,
+; so the controller's own timeout releases the motor and another app can be
+; tried without uninstalling anything.
+(define pkg-enabled 1)
+; Position Lock. Position comes from integrating rpm: hall sensors update it
+; on every commutation, so it tracks a wheel turned by hand at a standstill,
+; where a sensorless observer has nothing to say.
+(define lock-on nil)
+(define lock-acc 0)          ; milli-revolutions, electrical
+(define lock-time 0)
+(define cfg-lock-poles 15)   ; pole pairs, to report mechanical revolutions
+(define cfg-lock-travel 250) ; milli-revolutions, mechanical, for full torque
+(define cfg-lock-max 150)    ; hold current, fp
+(define cfg-lock-damp 300)   ; damping on rpm, fp
 (define live-throttle 0)
 (define live-duty 0)
 (define live-cur-rel 0)
@@ -110,13 +124,52 @@
                 (/ duty-filt-acc 1000)))))
 
 
+; Mechanical milli-revolutions of deflection since the lock engaged.
+(defun lock-error ()
+    (/ lock-acc (max-f 1 cfg-lock-poles)))
+
+(defun lock-release () (progn (setq lock-on nil) (setq lock-acc 0)))
+
+; Engaging is refused unless the machine is genuinely stopped and nothing is
+; being asked of it, so it can never be armed while riding.
+(defun lock-engage ()
+    (if (and (< (abs (to-i (get-rpm))) 50)
+             (= live-throttle 0)
+             (= live-brake 0))
+        (progn (setq lock-acc 0)
+               (setq lock-time (systime))
+               (setq lock-on t)
+               t)
+        nil))
+
+; A spring with its damper. The spring alone rings: inertia overshoots the
+; target every time, so the rpm term is not optional.
+;   travel -> the deflection at which the hold reaches its current ceiling
+(defun lock-tick ()
+    (let ((r (to-i (get-rpm))))
+        (progn
+            (setq lock-acc (+ lock-acc (/ r 12)))
+            (if (or (> (secs-since lock-time) 60)
+                    (> live-throttle 0)
+                    (> live-brake 0))
+                (progn (lock-release) (set-current-rel 0.0))
+                (let ((p (clamp-f (/ (* (lock-error) 1000)
+                                     (max-f 1 cfg-lock-travel)) -1000 1000))
+                      (d (/ (* cfg-lock-damp r) 2000)))
+                    (setq live-cur-rel
+                        (clamp-f (- 0 (+ (/ (* p cfg-lock-max) 1000) d))
+                                 (- 0 cfg-lock-max) cfg-lock-max))
+                    (set-current-rel (fp-to-f live-cur-rel)))))))
+
 (defun control-tick ()
-    (if storage-busy
-        (progn (setq live-cur-rel 0) (setq duty-filt-acc 0))
+    (if (or storage-busy (= pkg-enabled 0))
+        ; Command nothing at all: the firmware timeout releases the motor.
+        (progn (setq live-cur-rel 0) (setq duty-filt-acc 0) (lock-release))
         (progn
             (setq live-throttle (thr-read))
             (setq live-brake (thr-brake-read))
             (setq live-duty (duty-read))
+            (if lock-on (lock-tick)
             (let ((lever (> live-brake 0)))
                 (progn
                     (setq live-cur-rel
@@ -133,13 +186,13 @@
                     ; Straight through, on purpose: the map is the torque
                     ; request, and smoothing it would blunt the very thing
                     ; the cells are there to define.
-                    (apply-output live-cur-rel))))))
+                    (apply-output live-cur-rel)))))))
 
 (defun control-loop ()
     (loopwhile t (progn (control-tick) (sleep 0.005))))
 
 (defun telemetry-loop ()
-    (let ((b (array-create 17)))
+    (let ((b (array-create 23)))
         (progn (bufset-u8 b 0 pkt-live)
         (loopwhile t
             (progn
@@ -152,6 +205,10 @@
                 (bufset-i16 b 13 live-brake)
                 ; ADC1 voltage in millivolts for bidirectional calibration.
                 (bufset-i16 b 15 (clamp-f (to-i (* (get-adc 0) 1000.0)) 0 3300))
+                (bufset-u8 b 17 pkg-enabled)
+                (bufset-u8 b 18 (if lock-on 1 0))
+                (bufset-i16 b 19 (clamp-f (lock-error) -32000 32000))
+                (bufset-i16 b 21 (clamp-f (to-i (get-rpm)) -32000 32000))
                 (proto-send b)
                 (sleep 0.05))))))
 
@@ -258,9 +315,18 @@
                              (in-range (bufget-i16 data 9) 1 1000)
                              (<= (bufget-u8 data 11) 2)))
                     ((= cmd pkt-calibrate-bidir) (= n 1))
+                    ((= cmd pkt-set-enabled) (and (= n 2) (<= (bufget-u8 data 1) 1)))
+                    ((= cmd pkt-lock-cmd) (and (= n 2) (<= (bufget-u8 data 1) 1)))
+                    ((= cmd pkt-set-lock)
+                        (and (= n 8)
+                             (in-range (bufget-u8 data 1) 1 40)
+                             (in-range (bufget-i16 data 2) 20 5000)
+                             (in-range (bufget-i16 data 4) 20 500)
+                             (in-range (bufget-i16 data 6) 0 1000)))
                     ((= cmd pkt-set-test-thr)
                         (and (= n 3) (in-range (bufget-i16 data 1) -1000 1000)))
                     (t (and (= n 1) (>= cmd pkt-cmd-save) (<= cmd pkt-req-cfg))))))))
+
 
 (defun dispatch-packet (data)
     (let ((cmd (bufget-u8 data 0)))
@@ -323,6 +389,19 @@
                 (if (and (= thr-cfg-source thr-src-adc) (= thr-cfg-brake-mode thr-brake-bidir))
                     (progn (thr-calibrate-bidir-center) (thr-reset-state))
                     (exit-error 'bidir-calibration-requires-bidir-adc)))
+            ((= cmd pkt-set-enabled)
+                (progn (setq pkg-enabled (bufget-u8 data 1))
+                       (if (= pkg-enabled 0) (lock-release))))
+            ((= cmd pkt-set-lock)
+                (progn
+                    (setq cfg-lock-poles (bufget-u8 data 1))
+                    (setq cfg-lock-travel (bufget-i16 data 2))
+                    (setq cfg-lock-max (bufget-i16 data 4))
+                    (setq cfg-lock-damp (bufget-i16 data 6))))
+            ((= cmd pkt-lock-cmd)
+                (if (= (bufget-u8 data 1) 1)
+                    (if (not (lock-engage)) (exit-error 'lock-needs-standstill))
+                    (lock-release)))
             ((= cmd pkt-cmd-save) (if (not (storage-save)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-load) (if (not (storage-load)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-reset) (storage-reset))

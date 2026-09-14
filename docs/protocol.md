@@ -19,6 +19,10 @@ Map cells and throttle calibration use that same integer scale internally.
 | 08 | REQUEST_MAP | 1 |
 | 09 | REQUEST_CFG | 1 |
 | 0A | SET_TEST_THROTTLE | 3: value:i16, -1000..1000 (negative is a brake request) |
+| 0B | CALIBRATE_BIDIR | 1: captures the bidirectional neutral voltage |
+| 0C | SET_ENABLED | 2: enabled:u8 - 0 stops every motor command |
+| 0D | SET_LOCK | 8: pole_pairs:u8 travel_mrev:i16 max_current:i16 damping:i16 |
+| 0E | LOCK_CMD | 2: engage:u8 - refused unless stopped and idle |
 | 0B | CALIBRATE_BIDIRECTIONAL | 1: captures the present ADC1 voltage as the bidirectional neutral point; valid only for ADC1 bidirectional mode |
 
 There are three independent regenerate flags, one per region of the graph.
