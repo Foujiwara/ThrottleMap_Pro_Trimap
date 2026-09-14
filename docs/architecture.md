@@ -28,11 +28,13 @@ reverse torque rather than direction-independent braking. Native firmware
 limits remain active. There is no extra `timeout-reset` call because both
 motor commands already reset the firmware timeout.
 
-Sources: ADC, PPM, UART, and USB Test. Keep the ADC/PPM input decoder enabled
-and its control type Off. Bidirectional ADC uses the midpoint of configured
-start/end voltages, supports reversed endpoints, and applies deadband.
-After changing those ADC endpoints in App Settings, apply the package's
-throttle settings again (or restart) to invalidate the calibration cache.
+Sources: ADC, PPM, UART, and USB Test. For ADC modes, keep App to Use set to
+ADC and its control type Off: VESC Tool then supplies calibrated ADC1/ADC2
+values without commanding the motor. The package does not duplicate ADC
+Start/End calibration. Bidirectional mode uses VESC Tool's Start/End plus a
+package-owned neutral voltage, defaulting to 1.650 V; the UI shows live ADC1
+voltage and CALIBRER captures the present neutral point. That point is stored
+in the package EEPROM.
 
 UART accepts A5 / percent (0..200) / XOR checksum, preserving partial frames.
 UART, Test and PPM input expires after 500 ms without a valid update; expired
@@ -56,12 +58,12 @@ The map's vertical axis is signed. The brake half is only read when the
 brake map is enabled and the brake lever is above its deadband, so the
 default behaviour is byte-for-byte the stable package's.
 
-Brake type applies to the lever alone. Types 1 and 2 call `get-rpm` once
-per braking tick to decide between `set-brake-rel` and a negative
-`set-current-rel`; type 0 never calls it at all, so a regen-only setup
-pays nothing for the feature. Engine braking and overrun regen keep using
-`set-brake-rel` unconditionally - the vehicle must not creep backwards
-just because the throttle was released on a hill.
+Brake type applies to the brake lever alone. Type 0 is regen and calls
+`set-brake-rel`. Type 1 calls only `set-current-rel`: it applies negative
+current while moving forward and zero current once stopped so it cannot
+reverse. Type 2 calls only `set-current-rel` and keeps negative current
+through zero into reverse. Released-throttle engine braking and overrun regen
+remain separate map behaviours and continue to use regen.
 
 See [protocol](protocol.md), [storage layout](map_format.md),
 [audit](audit-2026-09-12.md) and [tests](../tests/README.md).

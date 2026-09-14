@@ -12,6 +12,7 @@
 (define pkt-req-map     0x08)
 (define pkt-req-cfg     0x09)
 (define pkt-set-test-thr 0x0A)
+(define pkt-calibrate-bidir 0x0B)
 
 (define pkt-live        0x80)
 (define pkt-map-row     0x81)

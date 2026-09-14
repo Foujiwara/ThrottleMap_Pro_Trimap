@@ -50,31 +50,17 @@
 (define cfg-packet (array-create 52))
 
 @const-start
-; Lever braking only. Engine braking and overrun regen always stay pure
-; regen: a bidirectional brake type must never reverse a released vehicle.
+; Lever braking only. Current modes never call the brake command: type 1
+; releases current at zero speed, while type 2 continues into reverse.
 (defun brake-apply (mag)
     (if (= cfg-brake-type 0)
         (set-brake-rel (fp-to-f mag))
         (let ((r (to-i (get-rpm))))
             (if (= cfg-brake-type 2)
-                ; Bidirectional: negative torque below the threshold, and
-                ; it keeps going once that torque has reversed the motor.
-                (if (> r cfg-rev-erpm)
-                    (set-brake-rel (fp-to-f mag))
-                    (set-current-rel (- (fp-to-f mag))))
-                (progn
-                    ; No reverse: negative torque only while it is still
-                    ; travelling forwards, and latched off the moment it
-                    ; reaches a stop. Deciding on speed alone oscillates -
-                    ; the torque reverses the motor, regen catches it, the
-                    ; speed lands back in the torque band, and it shunts
-                    ; backwards over and over. The latch clears when the
-                    ; lever is released or it rolls forwards again.
-                    (if (> r cfg-rev-erpm) (setq brake-stopped nil))
-                    (if (< r 50) (setq brake-stopped t))
-                    (if (or brake-stopped (> r cfg-rev-erpm))
-                        (set-brake-rel (fp-to-f mag))
-                        (set-current-rel (- (fp-to-f mag)))))))))
+                (set-current-rel (- (fp-to-f mag)))
+                (if (> r 0)
+                    (set-current-rel (- (fp-to-f mag)))
+                    (set-current-rel 0.0))))))
 
 (defun control-tick ()
     (if storage-busy
@@ -110,7 +96,7 @@
     (loopwhile t (progn (control-tick) (sleep 0.005))))
 
 (defun telemetry-loop ()
-    (let ((b (array-create 15)))
+    (let ((b (array-create 17)))
         (progn (bufset-u8 b 0 pkt-live)
         (loopwhile t
             (progn
@@ -121,6 +107,8 @@
                 (bufset-i16 b 9 live-cur-rel)
                 (bufset-i16 b 11 (clamp-f (to-i (* (get-current) 100.0)) -32768 32767))
                 (bufset-i16 b 13 live-brake)
+                ; ADC1 voltage in millivolts for bidirectional calibration.
+                (bufset-i16 b 15 (clamp-f (to-i (* (get-adc 0) 1000.0)) 0 3300))
                 (proto-send b)
                 (sleep 0.05))))))
 
@@ -227,6 +215,7 @@
                              (in-range (bufget-i16 data 7) 0 999)
                              (in-range (bufget-i16 data 9) 1 1000)
                              (<= (bufget-u8 data 11) 2)))
+                    ((= cmd pkt-calibrate-bidir) (= n 1))
                     ((= cmd pkt-set-test-thr)
                         (and (= n 3) (in-range (bufget-i16 data 1) -1000 1000)))
                     (t (and (= n 1) (>= cmd pkt-cmd-save) (<= cmd pkt-req-cfg))))))))
@@ -289,6 +278,10 @@
                     ; STOP clears the filter immediately.
                     (if (= thr-test-value 0)
                         (progn (setq thr-filtered 0) (setq thr-filter-acc 0)))))
+            ((= cmd pkt-calibrate-bidir)
+                (if (and (= thr-cfg-source thr-src-adc) (= thr-cfg-brake-mode thr-brake-bidir))
+                    (progn (thr-calibrate-bidir-center) (thr-reset-state))
+                    (exit-error 'bidir-calibration-requires-bidir-adc)))
             ((= cmd pkt-cmd-save) (if (not (storage-save)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-load) (if (not (storage-load)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-reset) (storage-reset))

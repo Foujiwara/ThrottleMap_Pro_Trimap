@@ -14,6 +14,7 @@
 (define thr-adc-cal-start 0)
 (define thr-adc-cal-end 0)
 (define thr-adc-cal-loaded nil)
+(define thr-bidir-center 1650)
 (define thr-signed-sample 0)
 (define uart-buf (array-create 3))
 (define uart-started nil)
@@ -54,15 +55,25 @@
 (defun thr-adc-signed ()
     (progn
         (thr-adc-cal-ensure)
-        (let ((span (- thr-adc-cal-end thr-adc-cal-start))
+        (let ((dir (if (> thr-adc-cal-end thr-adc-cal-start) 1 -1))
               (raw (to-fp (get-adc 0))))
-            (if (= span 0) 0
-                (let ((v (clamp-f (- (/ (* (- raw thr-adc-cal-start) 2000) span) 1000) -1000 1000))
+            (let ((delta (* (- raw thr-bidir-center) dir))
+                  (pos-span (* (- thr-adc-cal-end thr-bidir-center) dir))
+                  (neg-span (* (- thr-bidir-center thr-adc-cal-start) dir)))
+                (if (or (<= pos-span 0) (<= neg-span 0)) 0
+                (let ((v (if (>= delta 0)
+                             (clamp-f (/ (* delta 1000) pos-span) 0 1000)
+                             (clamp-f (/ (* delta 1000) neg-span) -1000 0)))
                       (mag (abs v)))
                     (if (<= mag thr-cfg-deadband) 0
                         (* (if (< v 0) -1 1)
                            (/ (* (- mag thr-cfg-deadband) 1000)
-                              (- 1000 thr-cfg-deadband)))))))))
+                              (- 1000 thr-cfg-deadband))))))))))
+
+; Captures only the neutral point of the bidirectional input. Start/end stay
+; owned by VESC Tool's ADC calibration.
+(defun thr-calibrate-bidir-center ()
+    (setq thr-bidir-center (clamp-f (to-fp (get-adc 0)) 0 3300)))
 
 ; Incremental parser preserves partial frames and resynchronizes after noise.
 (defun uart-throttle-byte (v)
@@ -117,9 +128,9 @@
 
 (defun thr-read ()
     (let ((raw (thr-read-raw))
-          (n (if (or (= thr-cfg-source thr-src-test)
-                     (and (= thr-cfg-source thr-src-adc) (= thr-cfg-brake-mode thr-brake-bidir)))
-                 (clamp-f raw 0 1000) (thr-normalize raw))))
+          (n (if (= thr-cfg-source thr-src-adc)
+                 (if (= thr-cfg-brake-mode thr-brake-bidir) raw (thr-deadband raw))
+                 (if (= thr-cfg-source thr-src-test) (clamp-f raw 0 1000) (thr-normalize raw)))))
         (progn (setq thr-expired (thr-input-expired))
         (if thr-expired
             (progn (setq thr-filter-acc 0) (setq thr-filtered 0))
@@ -130,7 +141,7 @@
                        (* thr-cfg-filter (- n (/ thr-filter-acc 1000)))
                        (- (/ (* thr-cfg-filter (mod thr-filter-acc 1000)) 1000))))
                 (setq thr-filtered (/ thr-filter-acc 1000))))
-        thr-filtered)))
+        (max-f 0 thr-filtered))))
 
 (defun thr-brake-read ()
     (cond
@@ -138,9 +149,7 @@
         ((= thr-cfg-source thr-src-test) (max-f 0 (- thr-test-value)))
         ((not (= thr-cfg-source thr-src-adc)) 0)
         ((= thr-cfg-brake-mode thr-brake-dual)
-            (thr-deadband (clamp-f
-                (/ (* (- (to-fp (get-adc-decoded 1)) thr-cfg-min) 1000)
-                   (max-f 1 (- thr-cfg-max thr-cfg-min))) 0 1000)))
-        ((= thr-cfg-brake-mode thr-brake-bidir) (max-f 0 (- thr-signed-sample)))
+            (thr-deadband (to-fp (get-adc-decoded 1))))
+        ((= thr-cfg-brake-mode thr-brake-bidir) (max-f 0 (- thr-filtered)))
         (t 0)))
 @const-end

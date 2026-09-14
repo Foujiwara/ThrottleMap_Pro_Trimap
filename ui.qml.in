@@ -52,6 +52,7 @@ Item {
     readonly property int cmdReqMap:     0x08
     readonly property int cmdReqCfg:     0x09
     readonly property int cmdSetTestThr: 0x0A
+    readonly property int cmdCalibrateBidir: 0x0B
 
     readonly property int rxLive:    0x80
     readonly property int rxMapRow:  0x81
@@ -144,6 +145,7 @@ Item {
     property real liveCurRel: 0
     property real liveCurA: 0
     property real liveBrake: 0
+    property real liveAdcVoltage: 0
     property string statusText: "Not connected"
     property string lastCmdStatus: "" // last SAVE/LOAD/RESET/REQUEST_* reply, see handleRx
 
@@ -180,8 +182,6 @@ Item {
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
     property int thrInvert: 0
-    property real thrMin: 0.02
-    property real thrMax: 0.98
     property real thrDeadband: 0.02
     property real thrFilter: 1.0
     property int thrBrakeMode: 0 // independent ADC2 brake channel
@@ -198,8 +198,7 @@ Item {
             range(c.preset,0,4,true); range(c.torqueResp,0.3,2,false); range(c.speedCoupling,0,1.5,false)
             range(c.transWidth,0.02,0.3,false); range(c.transShape,0,3,true); range(c.highHold,0,1,false)
             range(c.engineBrake,0,0.6,false); range(c.overrunRegen,0,0.5,false); range(c.regenCurve,0,3,true)
-            range(c.thrSource,0,3,true); range(c.thrInvert,0,1,true); range(c.thrMin,0,1,false); range(c.thrMax,0,1,false)
-            if (c.thrMin >= c.thrMax) throw Error("Min must be below Max")
+            range(c.thrSource,0,3,true); range(c.thrInvert,0,1,true)
             range(c.thrDeadband,0,0.999,false); range(c.thrFilter,0.001,1,false)
             if (c.thrBrakeMode !== undefined) range(c.thrBrakeMode,0,2,true)
             if (c.brakeMap !== undefined) range(c.brakeMap,0,1,true)
@@ -272,6 +271,7 @@ Item {
         var b = [cmdSetCell, t & 0xff, d & 0xff].concat(i16Bytes(fxEnc(v)))
         sendPacket(b)
     }
+    function calibrateBidirectional() { sendPacket([cmdCalibrateBidir]) }
     function sendSetMapRow(t) {
         var b = [cmdSetMapRow, t & 0xff]
         for (var d = 0; d < 21; d++)
@@ -316,8 +316,9 @@ Item {
     function sendSetThrottle() {
         benchValue = 0
         var b = [cmdSetThr, thrSource & 0xff, thrInvert & 0xff]
-        b = b.concat(i16Bytes(fxEnc(thrMin)))
-        b = b.concat(i16Bytes(fxEnc(thrMax)))
+        // Retained wire fields are inert for ADC: VESC Tool owns Start/End.
+        b = b.concat(i16Bytes(20))
+        b = b.concat(i16Bytes(980))
         b = b.concat(i16Bytes(fxEnc(thrDeadband)))
         b = b.concat(i16Bytes(fxEnc(thrFilter)))
         b.push(thrBrakeMode & 0xff)
@@ -399,7 +400,7 @@ Item {
         if (view.byteLength < 1) return
         var cmd = view.getUint8(0)
         if (cmd === rxLive) {
-            if (view.byteLength !== 15) return
+            if (view.byteLength !== 17) return
             lastLiveTime = Date.now()
             if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0) { requestMap(); requestCfg() }
             liveThrottle = fxDec(view.getInt16(1, false))
@@ -408,6 +409,7 @@ Item {
             liveCurRel = fxDec(view.getInt16(9, false))
             liveCurA = view.getInt16(11, false) / 100.0
             liveBrake = fxDec(view.getInt16(13, false))
+            liveAdcVoltage = view.getInt16(15, false) / 1000.0
             statusText = "Connected"
         } else if (cmd === rxMapRow) {
             if (view.byteLength !== 44) return
@@ -459,8 +461,6 @@ Item {
             cfgRegenCurve = view.getUint8(15)
             thrSource = view.getUint8(16)
             thrInvert = view.getUint8(17)
-            thrMin = fxDec(view.getInt16(18, false))
-            thrMax = fxDec(view.getInt16(20, false))
             thrDeadband = fxDec(view.getInt16(22, false))
             thrFilter = fxDec(view.getInt16(24, false))
             thrBrakeMode = view.getUint8(26)
@@ -2031,25 +2031,31 @@ Item {
                         visible: thrSource === 0
                         Layout.fillWidth: true
                         spacing: 2
-                        Label { text: "Braking (ADC only)"; color: "#ccc" }
+                        Label { text: "ADC input mode"; color: "#ccc" }
                         ComboBox {
                             Layout.fillWidth: true
-                            model: ["Off (map's engine braking only)",
-                                    "Dual channel: brake on ADC2, own 0-100%",
-                                    "Bidirectional: one ADC1, center = neutral"]
+                            model: ["Normal: ADC1, accelerator only",
+                                    "Double ADC: ADC1 accelerator + ADC2 brake",
+                                    "Bidirectional: ADC1 accelerator / brake"]
                             currentIndex: thrBrakeMode
                             onActivated: (idx) => { thrBrakeMode = idx; sendSetThrottle() }
                         }
                     }
                     Label {
                         visible: thrSource === 0 && thrBrakeMode === 1
-                        text: "Dual channel: for a separate accelerator + brake pedal/lever, each giving its own independent 0-100% signal (ADC1 = accel, ADC2 = brake)."
+                        text: "ADC1 is the accelerator and ADC2 is the brake. Both use VESC Tool's ADC calibration."
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
                     Label {
                         visible: thrSource === 0 && thrBrakeMode === 2
-                        text: "Bidirectional: a single ADC1 input, center-zero - above center is accelerator, below is brake. Uses the ADC app's own start/center/end calibration from App Settings -> ADC (conf-get 'adc-v1-start/-center/-end), not this package's own Min/Max below."
+                        text: "ADC1 is split around a package-specific neutral point. VESC Tool owns ADC Start/End; place the control at rest, then calibrate its neutral voltage below."
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    RowLayout {
+                        visible: thrSource === 0 && thrBrakeMode === 2
+                        Layout.fillWidth: true
+                        Label { text: "ADC1 live: " + liveAdcVoltage.toFixed(3) + " V"; color: "#fff"; Layout.fillWidth: true }
+                        Button { text: "CALIBRER"; onClicked: calibrateBidirectional() }
                     }
                     Label {
                         visible: thrSource === 0 && thrBrakeMode !== 0
@@ -2084,32 +2090,9 @@ Item {
                     }
                     Label {
                         text: ["Regen only: braking is set-brake-rel throughout, so the motor never produces torque against the direction of travel and never reverses.",
-                               "Current, no reverse: regen while rolling, then negative current below the threshold below, to pull it down to a complete stop. The moment it stops it latches back to regen until you let go of the lever, so it can never shunt backwards.",
-                               "Current, bidirectional: same as above, and once stopped it keeps going into reverse."][cfgBrakeType]
+                               "Current, no reverse: uses negative current while travelling forward, then commands zero current at standstill so it cannot reverse. It never sends a brake command.",
+                               "Current, bidirectional: uses signed current continuously and can drive directly into reverse. It never sends a brake command."][cfgBrakeType]
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
-                    }
-                    ColumnLayout {
-                        visible: cfgBrakeType !== 0
-                        Layout.fillWidth: true; spacing: 2
-                        RowLayout { Layout.fillWidth: true
-                            Label { text: "Switch to torque below (ERPM)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                            TextField {
-                                Layout.preferredWidth: 70
-                                horizontalAlignment: TextInput.AlignRight
-                                text: cfgRevErpm.toFixed(0)
-                                onEditingFinished: {
-                                    var v = parseClamped(text, 0, 20000)
-                                    if (v !== null) { cfgRevErpm = Math.round(v); sendSetConfig(false) }
-                                    text = Qt.binding(function() { return cfgRevErpm.toFixed(0) })
-                                }
-                            }
-                        }
-                        Slider {
-                            Layout.fillWidth: true; from: 0; to: 5000; stepSize: 50
-                            value: cfgRevErpm
-                            onMoved: cfgRevErpm = Math.round(value)
-                            onPressedChanged: if (!pressed) sendSetConfig(false)
-                        }
                     }
                     Label {
                         text: "Engine braking and overrun regen always stay pure regen whatever this is set to - only the brake lever itself can command negative torque."
@@ -2152,40 +2135,6 @@ Item {
                     ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 10
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Min (raw 0..1)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: thrMin.toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0, 0.5)
-                                        if (v !== null) thrMin = v
-                                        text = Qt.binding(function() { return thrMin.toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider { Layout.fillWidth: true; from: 0; to: 0.5; value: thrMin; onMoved: thrMin = value }
-                        }
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            RowLayout { Layout.fillWidth: true
-                                Label { text: "Max (raw 0..1)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                                TextField {
-                                    Layout.preferredWidth: 60
-                                    horizontalAlignment: TextInput.AlignRight
-                                    text: thrMax.toFixed(2)
-                                    onEditingFinished: {
-                                        var v = parseClamped(text, 0.5, 1.0)
-                                        if (v !== null) thrMax = v
-                                        text = Qt.binding(function() { return thrMax.toFixed(2) })
-                                    }
-                                }
-                            }
-                            Slider { Layout.fillWidth: true; from: 0.5; to: 1.0; value: thrMax; onMoved: thrMax = value }
-                        }
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
                             RowLayout { Layout.fillWidth: true
@@ -2262,7 +2211,7 @@ Item {
                             preset: cfgPreset, torqueResp: cfgTorqueResp, speedCoupling: cfgSpeedCoupling,
                             transWidth: cfgTransWidth, transShape: cfgTransShape, highHold: cfgHighHold,
                             engineBrake: cfgEngineBrake, overrunRegen: cfgOverrunRegen, regenCurve: cfgRegenCurve,
-                            thrSource: thrSource, thrInvert: thrInvert, thrMin: thrMin, thrMax: thrMax,
+                            thrSource: thrSource, thrInvert: thrInvert,
                             thrDeadband: thrDeadband, thrFilter: thrFilter, thrBrakeMode: thrBrakeMode,
                             brakeMap: cfgBrakeMap, brakeType: cfgBrakeType, revErpm: cfgRevErpm,
                             brakeStr: cfgBrakeStr, brakeResp: cfgBrakeResp,
@@ -2284,7 +2233,7 @@ Item {
                                         cfgTransShape = obj.cfg.transShape; cfgHighHold = obj.cfg.highHold
                                         cfgEngineBrake = obj.cfg.engineBrake; cfgOverrunRegen = obj.cfg.overrunRegen
                                         cfgRegenCurve = obj.cfg.regenCurve; thrSource = obj.cfg.thrSource
-                                        thrInvert = obj.cfg.thrInvert; thrMin = obj.cfg.thrMin; thrMax = obj.cfg.thrMax
+                                        thrInvert = obj.cfg.thrInvert
                                         thrDeadband = obj.cfg.thrDeadband; thrFilter = obj.cfg.thrFilter
                                         thrBrakeMode = obj.cfg.thrBrakeMode === undefined ? 0 : obj.cfg.thrBrakeMode
                                         cfgBrakeMap = obj.cfg.brakeMap === undefined ? 0 : obj.cfg.brakeMap

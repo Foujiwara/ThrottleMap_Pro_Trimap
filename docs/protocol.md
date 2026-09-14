@@ -12,13 +12,14 @@ Map cells and throttle calibration use that same integer scale internally.
 | 01 | SET_CELL | 5: row:u8 col:u8 value:i16 - col must be inside that row own column count |
 | 02 | SET_MAP_ROW | 44: row:u8 and 21 values:i16; only that row own columns are read, the tail is padding |
 | 03 | SET_CONFIG | 44: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 rev_erpm:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 rev_coupling:i16 rev_width:i16 rev_overrun:i16 rev_str:i16 rev_resp:i16 rev_hold:i16 rev_shape:u8 rev_curve:u8 regen_rev:u8 |
-| 04 | SET_THROTTLE | 12: source:u8 invert:u8 min:i16 max:i16 deadband:i16 filter:i16 brake_mode:u8 |
+| 04 | SET_THROTTLE | 12: source:u8 invert:u8 legacy_min:i16 legacy_max:i16 deadband:i16 filter:i16 brake_mode:u8. ADC Start/End are owned by VESC Tool; legacy_min/max are ignored for ADC. |
 | 05 | SAVE | 1 |
 | 06 | LOAD | 1 |
 | 07 | RESET | 1 |
 | 08 | REQUEST_MAP | 1 |
 | 09 | REQUEST_CFG | 1 |
 | 0A | SET_TEST_THROTTLE | 3: value:i16, -1000..1000 (negative is a brake request) |
+| 0B | CALIBRATE_BIDIRECTIONAL | 1: captures the present ADC1 voltage as the bidirectional neutral point; valid only for ADC1 bidirectional mode |
 
 There are three independent regenerate flags, one per region of the graph.
 `regenerate` rebuilds throttle rows 10..30 from the thermal parameters (and
@@ -31,21 +32,22 @@ regenerates even for Custom (preset 0), 0 preserves the current map even
 when importing a named preset.
 
 brake_map 0/1 enables the negative-throttle rows. brake_type is 0 regen
-only, 1 current no reverse, 2 current bidirectional; rev_erpm (0..20000)
-is the speed below which types 1 and 2 switch from regen to negative
-torque. Save transmits displayed settings and all rows with
+only, 1 current no reverse, 2 current bidirectional. Type 1 uses negative
+current only while travelling forward and commands zero current at/after a
+stop; type 2 uses signed current continuously. Only type 0 uses the brake
+command. Save transmits displayed settings and all rows with
 regenerate=0, then requests persistence. Import validates the entire JSON
 first, includes brake mode, sends metadata without regeneration, then rows.
 
 All packet lengths, indices, enum fields and numeric ranges are validated
 before mutation. Filter alpha must be at least 1 (0.001); zero would freeze
-the throttle. min must be below max.
+the throttle.
 
 ## Replies
 
 | Id | Name | Total bytes / payload |
 | --- | --- | --- |
-| 80 | LIVE | 15: throttle:i16 duty:i16 erpm:i32 current_rel:i16 current_A:i16 brake:i16 |
+| 80 | LIVE | 17: throttle:i16 duty:i16 erpm:i32 current_rel:i16 current_A:i16 brake:i16 adc1_mV:i16 |
 | 81 | MAP_ROW | 44: row:u8 and 21 values:i16; padding past a row own columns is sent as zero |
 | 82 | STATUS | 3: status:u8 original_command:u8 |
 | 83 | CFG_ECHO | 52: config fields, throttle fields, brake map:u8 brake type:u8 rev erpm:i16, then the brake and reverse generator fields in the same order as SET_CONFIG |
