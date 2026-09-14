@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 1
+    property int buildMarker: 2
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -1153,11 +1153,6 @@ Item {
                             }
                         }
                     }
-                    Button {
-                        text: "Send to VESC (generate authoritative map)"
-                        onClicked: { regenDebounce.stop(); regenerateLocalMap(); sendSetConfig(); requestMap() }
-                    }
-
                     Rectangle { Layout.fillWidth: true; height: 1; color: "#333"; visible: cfgBrakeMap === 1 }
 
                     // Second generator, for the brake half only. Separate
@@ -1521,9 +1516,13 @@ Item {
                     Flow {
                         Layout.fillWidth: true
                         spacing: 4
-                        Button { text: "+5%"; onClicked: bumpRow(curRow, 0.05) }
-                        Button { text: "-5%"; onClicked: bumpRow(curRow, -0.05) }
+                        Button { text: "+5%"; onClicked: bumpCells(0.05) }
+                        Button { text: "-5%"; onClicked: bumpCells(-0.05) }
                         Button { text: "Smooth"; onClicked: smoothRow(curRow) }
+                        Label {
+                            text: selection.active ? "+/-5% applies to the selection" : "+/-5% applies to the whole row"
+                            color: "#777"; font.pixelSize: 15
+                        }
                         Button { text: "Copy row"; onClicked: clipboardRow = mapRowSlice(curRow) }
                         Button { text: "Paste row"; enabled: clipboardRow !== null; onClicked: pasteRow(curRow) }
                     }
@@ -1564,15 +1563,28 @@ Item {
             // every button click here forced multiple full canvas
             // redraws instead of one). Batch the mutation into a single
             // array copy and assign mapData exactly once instead.
-            function bumpRow(t, delta) {
+            // Shifts every selected cell, or the whole current row when
+            // nothing is selected. One array copy and one row upload per
+            // touched row, not one per cell.
+            function bumpCells(delta) {
                 cfgPreset = 0
                 var arr = mapData.slice()
-                for (var d = 0; d < mapRowCols(t); d++) {
-                    var v = Math.max(-1, Math.min(1, getCell(t,d) + delta))
-                    arr[cellIdx(t, d)] = v
+                var rows = {}
+                var tmin = curRow, tmax = curRow, dmin = 0, dmax = 20
+                if (selection.active) {
+                    tmin = Math.min(selection.t0, selection.t1)
+                    tmax = Math.max(selection.t0, selection.t1)
+                    dmin = Math.min(selection.d0, selection.d1)
+                    dmax = Math.max(selection.d0, selection.d1)
+                }
+                for (var t = tmin; t <= tmax; t++) {
+                    var hi = Math.min(dmax, mapRowCols(t) - 1)
+                    for (var d = dmin; d <= hi; d++)
+                        arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, getCell(t, d) + delta))
+                    rows[t] = true
                 }
                 mapData = arr
-                sendSetMapRow(t)
+                for (var key in rows) sendSetMapRow(parseInt(key))
             }
             function smoothRow(t) {
                 cfgPreset = 0
@@ -2201,8 +2213,8 @@ Item {
                         spacing: 6
                         Button { text: "Save to VESC"; onClicked: sendSave() }
                         Button { text: "Load from VESC"; onClicked: { sendLoad(); requestMap(); requestCfg() } }
-                        Button { text: "Reset to defaults"; onClicked: { sendReset(); requestMap(); requestCfg() } }
                         Button { text: "Refresh from VESC"; onClicked: { requestMap(); requestCfg() } }
+                        Button { text: "Reset to defaults"; onClicked: { sendReset(); requestMap(); requestCfg() } }
                     }
                     // lastCmdStatus gets set on every STATUS reply (see
                     // handleRx) but had nowhere to show up before. Save
