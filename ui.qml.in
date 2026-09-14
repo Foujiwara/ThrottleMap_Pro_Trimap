@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 2
+    property int buildMarker: 3
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -932,7 +932,7 @@ Item {
                         onPressed: (mouse) => {
                             var c = heatmap.cellFromPos(mouse.x, mouse.y)
                             selection = { active: true, t0: c.t, d0: c.d, t1: c.t, d1: c.d }
-                            hoverT = c.t; hoverD = c.d
+                            pickCell(c)
                         }
                         onPositionChanged: (mouse) => {
                             if (!selection.active) return
@@ -941,7 +941,7 @@ Item {
                         }
                         onClicked: (mouse) => {
                             var c = heatmap.cellFromPos(mouse.x, mouse.y)
-                            hoverT = c.t; hoverD = c.d
+                            pickCell(c)
                         }
                     }
 
@@ -1510,7 +1510,18 @@ Item {
                     Label { text: "Row/Col tools"; font.bold: true; color: "#ddd" }
                     RowLayout {
                         Label { text: "Row"; color: "#aaa" }
-                        SpinBox { id: rowSpin; from: 0; to: mapThrN-1; editable: true; value: curRow; onValueModified: curRow = value }
+                        SpinBox {
+                            id: rowSpin
+                            from: 0; to: mapThrN-1; editable: true
+                            value: curRow
+                            // Writing `value` imperatively drops the binding
+                            // above; Qt.binding() re-establishes it so the
+                            // box keeps following clicks on the map.
+                            onValueModified: {
+                                curRow = value
+                                value = Qt.binding(function() { return curRow })
+                            }
+                        }
                         Label { text: rowPct(curRow) + " % throttle"; color: "#aaa" }
                     }
                     Flow {
@@ -1539,10 +1550,21 @@ Item {
                         Button { text: "Interp. selection"; enabled: selection.active; onClicked: interpolateSelection() }
                     }
 
-                    Label { text: "Drag on the map to multi-select cells."; wrapMode: Text.WordWrap; color: "#777"; font.pixelSize: 16 }
+                    Label {
+                        text: "Click a cell to aim these tools at it; drag to multi-select."
+                        wrapMode: Text.WordWrap; color: "#777"; font.pixelSize: 16
+                    }
                     }
                 }
 
+            // Every row/col tool reads curRow and colSpin, so a click has
+            // to move them too - otherwise Copy/Paste silently operate on
+            // whatever the spinboxes happened to be left at.
+            function pickCell(c) {
+                hoverT = c.t; hoverD = c.d
+                curRow = c.t
+                colSpin.value = c.d
+            }
             function isSelected(t, d) {
                 if (!selection.active) return false
                 var tmin = Math.min(selection.t0, selection.t1), tmax = Math.max(selection.t0, selection.t1)
