@@ -9,7 +9,8 @@
 (define storage-busy nil)
 
 @const-start
-(define eeprom-magic 20260920)
+(define eeprom-magic 20260921)
+(define eeprom-prev-magic 20260920)
 (define eeprom-legacy-magic 20260913)
 (define eeprom-legacy-magic0 20260912)
 (define eeprom-map-base 36)
@@ -48,7 +49,9 @@
         (bufset-u8 b 29 cfg-regen-curve)
         (bufset-u8 b 30 cfg-brake-map)
         (bufset-u8 b 31 cfg-brake-type)
-        (bufset-i16 b 32 cfg-rev-erpm)
+        ; Reuses the retired ERPM-threshold slot for the bidirectional-only
+        ; neutral voltage (mV). Start/end remain VESC Tool ADC settings.
+        (bufset-i16 b 32 thr-bidir-center)
         (bufset-u8 b 34 cfg-rev-shape)
         (bufset-u8 b 35 cfg-rev-curve)
         ; Brake generator lives past the map so a 20260914 image stays a
@@ -142,7 +145,7 @@
         (in-range (bufget-u8 b 29) 0 3)
         (in-range (bufget-u8 b 30) 0 1)
         (in-range (bufget-u8 b 31) 0 2)
-        (in-range (bufget-i16 b 32) 0 20000)
+        (in-range (bufget-i16 b 32) 0 3300)
         (storage-cells-valid b eeprom-map-base map-cells)))
 
 (defun storage-tail-valid (b)
@@ -195,7 +198,7 @@
         (setq cfg-regen-curve (bufget-u8 b 29))
         (setq cfg-brake-map (bufget-u8 b 30))
         (setq cfg-brake-type (bufget-u8 b 31))
-        (setq cfg-rev-erpm (bufget-i16 b 32))
+        (setq thr-bidir-center (bufget-i16 b 32))
         (setq cfg-rev-shape (bufget-u8 b 34))
         (setq cfg-rev-curve (bufget-u8 b 35))
         (setq cfg-brake-str (fp-to-f (bufget-i16 b 488)))
@@ -236,6 +239,24 @@
         (in-range (storage-buffer-i32 b 504) 0 2)
         (storage-cells-valid b 60 441)))
 
+; The previous Trimap image stored an unused ERPM switch threshold at byte 32.
+; Keep every other setting and map cell, but start its new centre calibration
+; at the safe default rather than interpreting ERPM as millivolts.
+(defun storage-prev-image-valid (b)
+    (and
+        (in-range (bufget-u8 b 4) 0 3)
+        (in-range (bufget-u8 b 5) 0 1)
+        (in-range (bufget-u8 b 6) 0 2)
+        (in-range (bufget-u8 b 7) 0 4)
+        (in-range (bufget-i16 b 8) 0 1000)
+        (in-range (bufget-i16 b 10) 0 1000)
+        (< (bufget-i16 b 8) (bufget-i16 b 10))
+        (in-range (bufget-i16 b 12) 0 999)
+        (in-range (bufget-i16 b 14) 1 1000)
+        (in-range (bufget-i16 b 32) 0 20000)
+        (storage-cells-valid b eeprom-map-base map-cells)
+        (storage-tail-valid b)))
+
 ; The 21 old throttle rows become rows 10..30 unchanged; the duty axis keeps
 ; every other column, which lands exactly on the new 10% grid.
 (defun storage-apply-legacy (b)
@@ -259,6 +280,7 @@
         (setq cfg-brake-map 0)
         (setq cfg-brake-type 0)
         (setq cfg-rev-erpm 500)
+        (setq thr-bidir-center 1650)
         (storage-brake-defaults)
         (looprange ti 0 21
             (looprange di 0 11
@@ -276,8 +298,9 @@
         (if (not (number? magic))
             nil
             (let ((legacy (or (= magic eeprom-legacy-magic)
-                              (= magic eeprom-legacy-magic0))))
-                (if (not (or legacy (= magic eeprom-magic)))
+                              (= magic eeprom-legacy-magic0)))
+                  (prev (= magic eeprom-prev-magic)))
+                (if (not (or legacy prev (= magic eeprom-magic)))
                     nil
                     (let ((b (array-create 508)) (ok t))
                         (progn (looprange s 0 127
@@ -289,6 +312,13 @@
                             ((not ok) nil)
                             (legacy (if (storage-legacy-valid b)
                                         (storage-apply-legacy b) nil))
+                            (prev (if (and (storage-prev-image-valid b)
+                                           (let ((sum (eeprom-read-i 127)))
+                                               (and (number? sum) (= sum (crc16 b)))))
+                                      (progn (storage-apply-image b)
+                                             (setq thr-bidir-center 1650)
+                                             t)
+                                      nil))
                             ((and (storage-image-valid b)
                                   (storage-tail-valid b)
                                   (let ((sum (eeprom-read-i 127)))
@@ -318,6 +348,7 @@
         (setq cfg-brake-map 0)
         (setq cfg-brake-type 0)
         (setq cfg-rev-erpm 500)
+        (setq thr-bidir-center 1650)
         (storage-brake-defaults)
         (setq thr-cfg-source thr-src-adc)
         (setq thr-cfg-invert 0)
