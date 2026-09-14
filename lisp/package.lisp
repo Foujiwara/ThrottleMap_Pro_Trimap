@@ -48,13 +48,21 @@
 ; so the controller's own timeout releases the motor and another app can be
 ; tried without uninstalling anything.
 (define pkg-enabled 1)
-; Position Lock. Position comes from integrating rpm: hall sensors update it
-; on every commutation, so it tracks a wheel turned by hand at a standstill,
-; where a sensorless observer has nothing to say.
+; Position Lock. Position is read from the tachometer, never integrated from
+; rpm. The tachometer counts hall edges - six per electrical revolution - so
+; it is exact while stopped and cannot drift. Integrating rpm cannot do this
+; job: get-rpm is a filtered rate that reads zero long before the rotor is
+; actually still, and the per-tick division threw away every movement slower
+; than its own truncation step, so a wheel pushed by hand registered nothing.
 (define lock-on nil)
-(define lock-acc 0)          ; milli-revolutions, electrical
+(define lock-ref 0)          ; tachometer reading at engage, mm
+(define lock-mm 0)           ; deflection since engage, mm
+(define lock-mmrev 261)      ; mm of travel per motor revolution
+(define lock-span 65)        ; mm of deflection for full hold current
 (define lock-time 0)
-(define cfg-lock-poles 15)   ; pole pairs, to report mechanical revolutions
+(define lock-reason 0)       ; why it last released: 1 timeout 2 throttle
+                             ; 3 brake 4 disabled 5 asked
+(define cfg-lock-timeout 60) ; seconds before it lets go; 0 = never
 (define cfg-lock-travel 250) ; milli-revolutions, mechanical, for full torque
 (define cfg-lock-max 150)    ; hold current, fp
 (define cfg-lock-damp 300)   ; damping on rpm, fp
@@ -124,22 +132,54 @@
                 (/ duty-filt-acc 1000)))))
 
 
-; Mechanical milli-revolutions of deflection since the lock engaged.
-(defun lock-error ()
-    (/ lock-acc (max-f 1 cfg-lock-poles)))
+; The tachometer, in millimetres. get-dist is the firmware's own signed
+; distance, built straight from the tachometer count.
+(defun lock-dist () (to-i (* (get-dist) 1000.0)))
 
-(defun lock-release () (progn (setq lock-on nil) (setq lock-acc 0)))
+; Millimetres of travel per motor revolution - the same wheel and gear
+; settings the distance itself is built from, so the two always agree.
+; Read once, at engage; falls back to the VESC default 83 mm wheel if the
+; configuration cannot be read.
+(defun lock-scale ()
+    (let ((r (trap (/ (* 3141.5926 (conf-get 'si-wheel-diameter))
+                      (conf-get 'si-gear-ratio)))))
+        (if (eq (car r) 'exit-ok)
+            (max-f 1 (to-i (car (cdr r))))
+            261)))
+
+(defun lock-set-span ()
+    (setq lock-span (max-f 1 (/ (* cfg-lock-travel lock-mmrev) 1000))))
+
+; Mechanical milli-revolutions of deflection since the lock engaged.
+(defun lock-error () (/ (* lock-mm 1000) lock-mmrev))
+
+(defun lock-release () (progn (setq lock-on nil) (setq lock-mm 0)))
+
+; Releasing from inside the loop: record why, and stop asking for current.
+(defun lock-stop (why)
+    (progn (lock-release) (setq lock-reason why) (set-current-rel 0.0)))
 
 ; Engaging is refused unless the machine is genuinely stopped and nothing is
-; being asked of it, so it can never be armed while riding.
+; being asked of it, so it can never be armed while riding. The tachometer
+; reading taken here is the zero the spring pulls back to.
 (defun lock-engage ()
     (if (and (< (abs (to-i (get-rpm))) 50)
              (= live-throttle 0)
              (= live-brake 0))
-        (progn (setq lock-acc 0)
-               (setq lock-time (systime))
-               (setq lock-on t)
-               t)
+        ; The one place the tachometer is read outside the loop, so it is
+        ; also the place to find out whether it can be read at all. If it
+        ; cannot, engaging fails here rather than killing the control loop.
+        (let ((r (trap (lock-dist))))
+            (if (eq (car r) 'exit-ok)
+                (progn (setq lock-reason 0)
+                       (setq lock-mmrev (lock-scale))
+                       (lock-set-span)
+                       (setq lock-ref (car (cdr r)))
+                       (setq lock-mm 0)
+                       (setq lock-time (systime))
+                       (setq lock-on t)
+                       t)
+                nil))
         nil))
 
 ; A spring with its damper. The spring alone rings: inertia overshoots the
@@ -148,18 +188,18 @@
 (defun lock-tick ()
     (let ((r (to-i (get-rpm))))
         (progn
-            (setq lock-acc (+ lock-acc (/ r 12)))
-            (if (or (> (secs-since lock-time) 60)
-                    (> live-throttle 0)
-                    (> live-brake 0))
-                (progn (lock-release) (set-current-rel 0.0))
-                (let ((p (clamp-f (/ (* (lock-error) 1000)
-                                     (max-f 1 cfg-lock-travel)) -1000 1000))
+            (setq lock-mm (- (lock-dist) lock-ref))
+            (if (> live-throttle 0) (lock-stop 2)
+             (if (> live-brake 0) (lock-stop 3)
+              (if (and (> cfg-lock-timeout 0)
+                       (> (secs-since lock-time) cfg-lock-timeout))
+                  (lock-stop 1)
+                (let ((p (clamp-f (/ (* lock-mm 1000) lock-span) -1000 1000))
                       (d (/ (* cfg-lock-damp r) 2000)))
                     (setq live-cur-rel
                         (clamp-f (- 0 (+ (/ (* p cfg-lock-max) 1000) d))
                                  (- 0 cfg-lock-max) cfg-lock-max))
-                    (set-current-rel (fp-to-f live-cur-rel)))))))
+                    (set-current-rel (fp-to-f live-cur-rel)))))))))
 
 (defun control-tick ()
     (if (or storage-busy (= pkg-enabled 0))
@@ -213,7 +253,8 @@
                 ; ADC1 voltage in millivolts for bidirectional calibration.
                 (bufset-i16 b 15 (clamp-f (to-i (* (get-adc 0) 1000.0)) 0 3300))
                 (bufset-u8 b 17 pkg-enabled)
-                (bufset-u8 b 18 (if lock-on 1 0))
+                ; state in the low nibble, last release reason above it
+                (bufset-u8 b 18 (+ (if lock-on 1 0) (* 16 lock-reason)))
                 (bufset-i16 b 19 (if lock-on (clamp-f (lock-error) -32000 32000) 0))
                 (bufset-i16 b 21 (clamp-f (to-i (get-rpm)) -32000 32000))
                 (proto-send b)
@@ -326,8 +367,7 @@
                     ((= cmd pkt-lock-cmd) (and (= n 2) (<= (bufget-u8 data 1) 1)))
                     ((= cmd pkt-set-lock)
                         (and (= n 8)
-                             (in-range (bufget-u8 data 1) 1 40)
-                             (in-range (bufget-i16 data 2) 20 5000)
+                             (in-range (bufget-i16 data 2) 0 10000)
                              (in-range (bufget-i16 data 4) 20 500)
                              (in-range (bufget-i16 data 6) 0 1000)))
                     ((= cmd pkt-set-test-thr)
@@ -399,17 +439,19 @@
             ((= cmd pkt-set-enabled)
                 (progn (setq pkg-enabled (bufget-u8 data 1))
                        (setq duty-filt-acc 0)
-                       (lock-release)))
+                       (lock-release)
+                       (setq lock-reason 4)))
             ((= cmd pkt-set-lock)
                 (progn
-                    (setq cfg-lock-poles (bufget-u8 data 1))
+                    (setq cfg-lock-timeout (bufget-u8 data 1))
                     (setq cfg-lock-travel (bufget-i16 data 2))
                     (setq cfg-lock-max (bufget-i16 data 4))
-                    (setq cfg-lock-damp (bufget-i16 data 6))))
+                    (setq cfg-lock-damp (bufget-i16 data 6))
+                    (lock-set-span)))
             ((= cmd pkt-lock-cmd)
                 (if (= (bufget-u8 data 1) 1)
                     (if (not (lock-engage)) (exit-error 'lock-needs-standstill))
-                    (lock-release)))
+                    (progn (lock-release) (setq lock-reason 5))))
             ((= cmd pkt-cmd-save) (if (not (storage-save)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-load) (if (not (storage-load)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-reset) (storage-reset))

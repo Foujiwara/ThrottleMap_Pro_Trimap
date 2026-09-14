@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 9
+    property int buildMarker: 11
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -155,7 +155,8 @@ Item {
     property real liveRpmFast: 0
     // Lock settings live in RAM on the controller: the EEPROM is full, and
     // the lock can only be engaged from here anyway.
-    property int lockPoles: 15
+    property int lockReason: 0      // 1 timeout 2 throttle 3 brake 4 off 5 asked
+    property int lockTimeout: 60    // seconds; 0 = never lets go
     property real lockTravel: 0.25  // revolutions for full hold current
     property real lockMax: 0.15     // hold current, relative
     property real lockDamp: 0.30
@@ -289,7 +290,7 @@ Item {
     function calibrateBidirectional() { sendPacket([cmdCalibrateBidir]) }
     function sendEnabled(on) { sendPacket([cmdSetEnabled, on ? 1 : 0]) }
     function sendLockCfg() {
-        var b = [cmdSetLock, lockPoles & 0xff]
+        var b = [cmdSetLock, lockTimeout & 0xff]
         b = b.concat(i16Bytes(Math.round(lockTravel * 1000)))
         b = b.concat(i16Bytes(Math.round(lockMax * 1000)))
         b = b.concat(i16Bytes(Math.round(lockDamp * 1000)))
@@ -435,7 +436,8 @@ Item {
             liveBrake = fxDec(view.getInt16(13, false))
             liveAdcVoltage = view.getInt16(15, false) / 1000.0
             pkgEnabled = view.getUint8(17)
-            lockState = view.getUint8(18)
+            lockState = view.getUint8(18) & 0x0f
+            lockReason = view.getUint8(18) >> 4
             lockErr = view.getInt16(19, false) / 1000.0
             liveRpmFast = view.getInt16(21, false)
             statusText = "Connected"
@@ -2043,7 +2045,7 @@ Item {
 
                     Label { text: "Position lock"; font.bold: true; color: "#ddd" }
                     Label {
-                        text: "Holds the machine in place without freezing it: it gives way under load, and pushes back harder the further it is moved. Position comes from integrating the motor speed, which your hall sensors keep updating at a standstill."
+                        text: "Holds the machine in place without freezing it: it gives way under load, and pushes back harder the further it is moved. Position is read from the tachometer, which counts hall edges, so it is exact at a standstill and cannot drift."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
@@ -2059,9 +2061,25 @@ Item {
                         Label { text: "Deflection"; color: "#aaa" }
                         Label { text: lockErr.toFixed(3) + " turns"; color: "#fff" }
                         Label { text: "Hold current"; color: "#aaa" }
-                        Label { text: (liveCurRel * 100).toFixed(1) + " %"; color: "#fff" }
+                        Label { text: (liveCurRel * 100).toFixed(1) + " % asked"; color: "#fff" }
+                        Label { text: "Motor current"; color: "#aaa" }
+                        Label {
+                            text: liveCurA.toFixed(1) + " A measured"
+                            color: (lockState === 1 && Math.abs(liveCurRel) > 0.01 && Math.abs(liveCurA) < 0.5) ? "#ff9955" : "#fff"
+                        }
                         Label { text: "ERPM"; color: "#aaa" }
                         Label { text: liveRpmFast.toFixed(0); color: "#fff" }
+                        Label { text: "Last release"; color: "#aaa" }
+                        Label {
+                            text: ["-", "timed out", "throttle input", "brake input",
+                                   "package disabled", "you asked"][lockReason] || "-"
+                            color: "#fff"
+                        }
+                    }
+                    Label {
+                        visible: lockState === 1 && Math.abs(liveCurRel) > 0.01 && Math.abs(liveCurA) < 0.5
+                        text: "Current is being asked for and the motor is not taking it. That is a motor-side limit, not this loop: check the minimum current, the sensor mode at standstill, and that no other app is commanding the motor."
+                        color: "#ff9955"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
                     Flow {
@@ -2080,7 +2098,7 @@ Item {
                         }
                     }
                     Label {
-                        text: "Engaging is refused unless the machine is stopped with nothing asked of it. Any throttle or brake input releases it immediately, and it releases itself after 60 seconds."
+                        text: "Engaging is refused unless the machine is stopped with nothing asked of it. Any throttle or brake input releases it immediately."
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
                     Label {
@@ -2094,27 +2112,54 @@ Item {
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 2
                         RowLayout { Layout.fillWidth: true
+                            Label { text: "Hold time (s, 0 = no limit)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: lockTimeout.toFixed(0)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0, 255)
+                                    if (v !== null) { lockTimeout = Math.round(v); sendLockCfg() }
+                                    text = Qt.binding(function() { return lockTimeout.toFixed(0) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0; to: 255; stepSize: 5
+                            value: lockTimeout
+                            onMoved: lockTimeout = Math.round(value)
+                            onPressedChanged: if (!pressed) sendLockCfg()
+                        }
+                    }
+                    Label {
+                        text: "How long it may hold before letting go on its own. 0 removes the limit entirely - the heat in the phases is then yours to watch."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
                             Label { text: "Tolerated travel (turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
                             TextField {
                                 Layout.preferredWidth: 60
                                 horizontalAlignment: TextInput.AlignRight
                                 text: lockTravel.toFixed(2)
                                 onEditingFinished: {
-                                    var v = parseClamped(text, 0.02, 5.0)
+                                    var v = parseClamped(text, 0.0, 10.0)
                                     if (v !== null) { lockTravel = v; sendLockCfg() }
                                     text = Qt.binding(function() { return lockTravel.toFixed(2) })
                                 }
                             }
                         }
                         Slider {
-                            Layout.fillWidth: true; from: 0.02; to: 2.0
+                            Layout.fillWidth: true; from: 0.0; to: 10.0; stepSize: 0.05
                             value: lockTravel
                             onMoved: lockTravel = value
                             onPressedChanged: if (!pressed) sendLockCfg()
                         }
                     }
                     Label {
-                        text: "How far it may be pushed before the hold reaches its current ceiling. Smaller is stiffer."
+                        text: "Wheel turns it may be pushed through before the hold reaches its current ceiling. Smaller is stiffer; 0 means full current at the first millimetre of movement."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
@@ -2172,24 +2217,8 @@ Item {
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
-                    ColumnLayout {
-                        Layout.fillWidth: true; spacing: 2
-                        RowLayout { Layout.fillWidth: true
-                            Label { text: "Motor pole pairs"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
-                            TextField {
-                                Layout.preferredWidth: 60
-                                horizontalAlignment: TextInput.AlignRight
-                                text: lockPoles.toFixed(0)
-                                onEditingFinished: {
-                                    var v = parseClamped(text, 1, 40)
-                                    if (v !== null) { lockPoles = Math.round(v); sendLockCfg() }
-                                    text = Qt.binding(function() { return lockPoles.toFixed(0) })
-                                }
-                            }
-                        }
-                    }
                     Label {
-                        text: "Only converts the reading into real wheel turns - half the pole count in your motor configuration. Wrong here just rescales the numbers, it changes nothing about the hold."
+                        text: "Position is read from the tachometer, so it is exact at a standstill and never drifts. Turns are scaled with the wheel diameter and gear ratio from your motor configuration - if those are wrong, the numbers are rescaled but the hold itself is unaffected."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
