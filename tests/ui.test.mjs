@@ -41,7 +41,8 @@ const state={console,ArrayBuffer,DataView,Date,Math,Array,isFinite,Error,
  lastLiveTime:0,lastAutoReq:0,lastCmdStatus:'',statusText:'',benchValue:0,
  liveThrottle:0,liveDuty:0,liveErpm:0,liveCurRel:0,liveCurA:0,liveBrake:0,
  liveAdcVoltage:0,liveRpmFast:0,pkgEnabled:1,lockState:0,lockReason:0,lockErr:0,
- scriptBooting:false,autoLoadDone:false,autoLoadPending:false,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
+ scriptBooting:false,autoLoadDone:false,autoLoadPending:false,
+ mapScratch:[],mapRetries:0,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
  cmdSetCell:1,cmdSetMapRow:2,cmdSetConfig:3,cmdSetThr:4,cmdSave:5,cmdLoad:6,cmdReset:7,
  cmdReqMap:8,cmdReqCfg:9,cmdSetTestThr:10,cmdCalibrateBidir:11,cmdSetEnabled:12,
  cmdSetLock:13,cmdLockCmd:14,rxLive:128,rxMapRow:129,rxStatus:130,rxCfgEcho:131};
@@ -160,8 +161,34 @@ assert.throws(()=>state.validateImport({map:Array(450).fill(0)}));
 assert.throws(()=>state.validateImport({map:Array(451).fill(0),cfg:{preset:1}}));
 assert.doesNotThrow(()=>state.validateImport({map:Array(451).fill(-0.5)}));
 
-// ---- incomplete read-back ------------------------------------------------
-state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];
-state.requestMap();ack();assert.equal(state.mapReceived,false);
-assert.match(state.lastCmdStatus,/Incomplete/);
+// ---- the map read-back ---------------------------------------------------
+// Rows are folded into a scratch buffer and published once. Assigning
+// mapData per row repainted 451 cells 31 times while the next packet was
+// already arriving, and rows were dropped in the gaps.
+function rowPacket(row,value) {
+ const b=new Uint8Array(44);const v=new DataView(b.buffer);
+ b[0]=129;v.setUint8(1,row);
+ for(let d=0;d<state.mapRowCols(row);d++)v.setInt16(2+d*2,value,false);
+ return b.buffer;
+}
+state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];state.mapRetries=0;
+state.mapData=Array(451).fill(0);
+state.requestMap();
+for(let r=0;r<31;r++)state.handleRx(rowPacket(r,250));
+assert.deepEqual(state.mapData,Array(451).fill(0),'nothing is published mid-read');
+ack();
+assert.equal(state.mapReceived,true);
+assert.equal(state.mapData[0],0.25,'the buffer is published on completion');
+assert.equal(state.mapData[450],0.25);
+
+// A dropped row is a link hiccup, not a broken map: ask again. Giving up at
+// the first miss left the grid drawn as zeros with no way back but a manual
+// Load.
+state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];state.mapRetries=0;
+state.requestMap();
+ack();assert.match(state.lastCmdStatus,/retrying \(1\/3\)/);
+assert.equal(state.pendingPacket[0],state.cmdReqMap);
+ack();ack();
+assert.equal(state.mapReceived,false);
+ack();assert.match(state.lastCmdStatus,/Incomplete/);
 console.log('QML JavaScript regression tests passed');
