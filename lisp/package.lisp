@@ -23,7 +23,8 @@
 (define cfg-brake-map 0)
 ; 0 regen only, 1 current no reverse, 2 current bidirectional.
 (define cfg-brake-type 0)
-(define cfg-rev-erpm 500)
+; Wire byte 19 / echo byte 29 are reserved: the ERPM switch threshold they
+; used to carry is gone, replaced by the direction latch below.
 ; Brake half generator - see gen-brake-map in map.lisp.
 (define cfg-brake-str 1.0)
 (define cfg-brake-resp 1.0)
@@ -43,24 +44,40 @@
 (define live-duty 0)
 (define live-cur-rel 0)
 (define live-brake 0)
-; Latched once "no reverse" braking has brought the vehicle to a stop.
-(define brake-stopped nil)
+; Direction latch for the no-reverse brake type. A bare (> rpm 0) test
+; oscillates: the negative current it gates is exactly what drives the rpm
+; through zero, so the decision flips every tick. Two thresholds instead of
+; one - enter below 50 ERPM, leave only above 300 - and nothing in between
+; can change the state.
+(define rev-blocked nil)
 ; One buffer per owner: telemetry never shares its buffer with the event task.
 (define row-packet (array-create 44))
 (define cfg-packet (array-create 52))
 
 @const-start
-; Lever braking only. Current modes never call the brake command: type 1
-; releases current at zero speed, while type 2 continues into reverse.
-(defun brake-apply (mag)
-    (if (= cfg-brake-type 0)
-        (set-brake-rel (fp-to-f mag))
-        (let ((r (to-i (get-rpm))))
-            (if (= cfg-brake-type 2)
-                (set-current-rel (- (fp-to-f mag)))
-                (if (> r 0)
-                    (set-current-rel (- (fp-to-f mag)))
-                    (set-current-rel 0.0))))))
+(defun rev-guard-update ()
+    (let ((r (to-i (get-rpm))))
+        (progn
+            (if (> r 300) (setq rev-blocked nil))
+            (if (< r 50) (setq rev-blocked t)))))
+
+; The command mode follows the ADC input mode, not the sign of the output:
+;   Normal      - no brake channel, so a negative map value is pure regen
+;                 and goes out as set-brake-rel, which cannot reverse.
+;   Double ADC  - signed current throughout, never a brake command.
+;   Bidirectional
+; In the two brake modes, "no reverse" holds zero current once the latch
+; says the vehicle has stopped, instead of driving it backwards.
+(defun apply-output (v)
+    (if (= thr-cfg-brake-mode thr-brake-none)
+        (if (< v 0)
+            (set-brake-rel (fp-to-f (- v)))
+            (set-current-rel (fp-to-f v)))
+        (progn
+            (rev-guard-update)
+            (if (and (< v 0) (< cfg-brake-type 2) rev-blocked)
+                (set-current-rel 0.0)
+                (set-current-rel (fp-to-f v))))))
 
 (defun control-tick ()
     (if storage-busy
@@ -71,7 +88,6 @@
             (setq live-duty (to-fp (get-duty)))
             (let ((lever (> live-brake 0)))
                 (progn
-                    (if (not lever) (setq brake-stopped nil))
                     (setq live-cur-rel
                         (if thr-expired 0
                             (if lever
@@ -85,12 +101,7 @@
                                     (let ((v (map-lookup (- live-brake) live-duty)))
                                         (if (= cfg-brake-type 2) v (min-f v 0))))
                                 (map-lookup live-throttle live-duty))))
-                    ; Negative map values mean braking, not reverse propulsion.
-                    (if (< live-cur-rel 0)
-                        (if lever
-                            (brake-apply (- live-cur-rel))
-                            (set-brake-rel (fp-to-f (- live-cur-rel))))
-                        (set-current-rel (fp-to-f live-cur-rel))))))))
+                    (apply-output live-cur-rel))))))
 
 (defun control-loop ()
     (loopwhile t (progn (control-tick) (sleep 0.005))))
@@ -147,7 +158,7 @@
         (bufset-u8 b 26 thr-cfg-brake-mode)
         (bufset-u8 b 27 cfg-brake-map)
         (bufset-u8 b 28 cfg-brake-type)
-        (bufset-i16 b 29 cfg-rev-erpm)
+        (bufset-i16 b 29 0)
         (bufset-i16 b 31 (fx-enc cfg-brake-str))
         (bufset-i16 b 33 (fx-enc cfg-brake-resp))
         (bufset-i16 b 35 (fx-enc cfg-brake-dep))
@@ -241,7 +252,6 @@
                     (setq cfg-regen-curve (bufget-u8 data 15))
                     (setq cfg-brake-map (bufget-u8 data 17))
                     (setq cfg-brake-type (bufget-u8 data 18))
-                    (setq cfg-rev-erpm (bufget-i16 data 19))
                     (setq cfg-brake-str (fx-dec (bufget-i16 data 21)))
                     (setq cfg-brake-resp (fx-dec (bufget-i16 data 23)))
                     (setq cfg-brake-dep (fx-dec (bufget-i16 data 25)))

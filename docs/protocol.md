@@ -11,7 +11,7 @@ Map cells and throttle calibration use that same integer scale internally.
 | --- | --- | --- |
 | 01 | SET_CELL | 5: row:u8 col:u8 value:i16 - col must be inside that row own column count |
 | 02 | SET_MAP_ROW | 44: row:u8 and 21 values:i16; only that row own columns are read, the tail is padding |
-| 03 | SET_CONFIG | 44: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 rev_erpm:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 rev_coupling:i16 rev_width:i16 rev_overrun:i16 rev_str:i16 rev_resp:i16 rev_hold:i16 rev_shape:u8 rev_curve:u8 regen_rev:u8 |
+| 03 | SET_CONFIG | 44: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 reserved:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 rev_coupling:i16 rev_width:i16 rev_overrun:i16 rev_str:i16 rev_resp:i16 rev_hold:i16 rev_shape:u8 rev_curve:u8 regen_rev:u8 |
 | 04 | SET_THROTTLE | 12: source:u8 invert:u8 legacy_min:i16 legacy_max:i16 deadband:i16 filter:i16 brake_mode:u8. ADC Start/End are owned by VESC Tool; legacy_min/max are ignored for ADC. |
 | 05 | SAVE | 1 |
 | 06 | LOAD | 1 |
@@ -50,7 +50,7 @@ the throttle.
 | 80 | LIVE | 17: throttle:i16 duty:i16 erpm:i32 current_rel:i16 current_A:i16 brake:i16 adc1_mV:i16 |
 | 81 | MAP_ROW | 44: row:u8 and 21 values:i16; padding past a row own columns is sent as zero |
 | 82 | STATUS | 3: status:u8 original_command:u8 |
-| 83 | CFG_ECHO | 52: config fields, throttle fields, brake map:u8 brake type:u8 rev erpm:i16, then the brake and reverse generator fields in the same order as SET_CONFIG |
+| 83 | CFG_ECHO | 52: config fields, throttle fields, brake map:u8 brake type:u8 reserved:i16, then the brake and reverse generator fields in the same order as SET_CONFIG |
 
 Status: 0 OK, 1 saved and verified, 2 loaded, 3 reset, 4 save failed,
 5 no valid saved image, 6 invalid packet, 7 command execution failed.
