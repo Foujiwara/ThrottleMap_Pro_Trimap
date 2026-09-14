@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 18
+    property int buildMarker: 19
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -158,7 +158,8 @@ Item {
     property int lockReason: 0      // 1 timeout 2 throttle 3 brake 4 off 5 asked
     property bool scriptBooting: false
     property int lockTimeout: 60    // seconds; 0 = never lets go
-    property real lockTravel: 0.25  // revolutions for full hold current
+    property real lockFree: 0.0     // revolutions of free play before any force
+    property real lockTravel: 0.25  // further revolutions for full hold current
     property real lockMax: 0.15     // hold current, relative
     property real lockDamp: 0.30
     property string statusText: "Not connected"
@@ -295,6 +296,7 @@ Item {
         b = b.concat(i16Bytes(Math.round(lockTravel * 1000)))
         b = b.concat(i16Bytes(Math.round(lockMax * 1000)))
         b = b.concat(i16Bytes(Math.round(lockDamp * 1000)))
+        b = b.concat(i16Bytes(Math.round(lockFree * 1000)))
         sendPacket(b)
     }
     function sendLock(on) { sendPacket([cmdLockCmd, on ? 1 : 0]) }
@@ -2190,6 +2192,33 @@ Item {
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 2
                         RowLayout { Layout.fillWidth: true
+                            Label { text: "Dead travel (motor turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: lockFree.toFixed(2)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0.0, 10.0)
+                                    if (v !== null) { lockFree = v; sendLockCfg() }
+                                    text = Qt.binding(function() { return lockFree.toFixed(2) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0.0; to: 10.0; stepSize: 0.05
+                            value: lockFree
+                            onMoved: lockFree = value
+                            onPressedChanged: if (!pressed) sendLockCfg()
+                        }
+                    }
+                    Label {
+                        text: "Turns it may be moved through with no current at all - genuinely free, neither spring nor damping. The hold below starts where this ends. 0 makes it act from the first millimetre."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
                             Label { text: "Tolerated travel (motor turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
                             TextField {
                                 Layout.preferredWidth: 60
@@ -2210,7 +2239,7 @@ Item {
                         }
                     }
                     Label {
-                        text: "Motor turns it may be pushed through before the hold reaches its current ceiling - the same as wheel turns on a direct drive, divided by the gear ratio otherwise. Smaller is stiffer; 0 means full current at the first millimetre of movement."
+                        text: "Turns of further deflection, past the dead travel, over which the hold builds to its current ceiling. Smaller is stiffer. Motor turns are the same as wheel turns on a direct drive, divided by the gear ratio otherwise."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 

@@ -64,7 +64,9 @@
 (define lock-ref 0)          ; tachometer reading at engage, mm
 (define lock-mm 0)           ; deflection since engage, mm
 (define lock-mmrev 261)      ; mm of travel per motor revolution
-(define lock-span 65)        ; mm of deflection for full hold current
+(define lock-span 65)        ; mm of spring travel for full hold current
+(define lock-dead 0)         ; mm of free play before anything is commanded
+(define cfg-lock-free 0)     ; milli-revolutions of free play
 (define lock-time 0)
 (define lock-reason 0)       ; why it last released: 1 timeout 2 throttle
                              ; 3 brake 4 disabled 5 asked
@@ -154,7 +156,17 @@
             261)))
 
 (defun lock-set-span ()
-    (setq lock-span (max-f 1 (/ (* cfg-lock-travel lock-mmrev) 1000))))
+    (progn
+        (setq lock-dead (/ (* cfg-lock-free lock-mmrev) 1000))
+        (setq lock-span (max-f 1 (/ (* cfg-lock-travel lock-mmrev) 1000)))))
+
+; Deflection past the free play, signed, zero inside it. The spring and the
+; damper both work off this: inside the free play nothing is commanded at
+; all, which is what makes it free rather than merely soft.
+(defun lock-load ()
+    (if (> lock-mm lock-dead)
+        (- lock-mm lock-dead)
+        (if (< lock-mm (- 0 lock-dead)) (+ lock-mm lock-dead) 0)))
 
 ; Mechanical milli-revolutions of deflection since the lock engaged.
 (defun lock-error () (/ (* lock-mm 1000) lock-mmrev))
@@ -204,12 +216,16 @@
                 ; without it the setq runs and the set-current-rel below it
                 ; is silently dropped - the request shows in telemetry and
                 ; the motor never hears about it.
-                (let ((p (clamp-f (/ (* lock-mm 1000) lock-span) -1000 1000))
-                      (d (/ (* cfg-lock-damp r) 2000)))
+                (let ((e (lock-load)))
                     (progn
                         (setq live-cur-rel
-                            (clamp-f (- 0 (+ (/ (* p cfg-lock-max) 1000) d))
-                                     (- 0 cfg-lock-max) cfg-lock-max))
+                            (if (= e 0)
+                                0
+                                (let ((p (clamp-f (/ (* e 1000) lock-span)
+                                                  -1000 1000))
+                                      (d (/ (* cfg-lock-damp r) 2000)))
+                                    (clamp-f (- 0 (+ (/ (* p cfg-lock-max) 1000) d))
+                                             (- 0 cfg-lock-max) cfg-lock-max))))
                         (set-current-rel (fp-to-f live-cur-rel))))))))))
 
 (defun control-tick ()
@@ -382,10 +398,11 @@
                     ((= cmd pkt-set-enabled) (and (= n 2) (<= (bufget-u8 data 1) 1)))
                     ((= cmd pkt-lock-cmd) (and (= n 2) (<= (bufget-u8 data 1) 1)))
                     ((= cmd pkt-set-lock)
-                        (and (= n 8)
+                        (and (= n 10)
                              (in-range (bufget-i16 data 2) 0 10000)
                              (in-range (bufget-i16 data 4) 20 500)
-                             (in-range (bufget-i16 data 6) 0 1000)))
+                             (in-range (bufget-i16 data 6) 0 1000)
+                             (in-range (bufget-i16 data 8) 0 10000)))
                     ((= cmd pkt-set-test-thr)
                         (and (= n 3) (in-range (bufget-i16 data 1) -1000 1000)))
                     (t (and (= n 1) (>= cmd pkt-cmd-save) (<= cmd pkt-req-cfg))))))))
@@ -463,6 +480,7 @@
                     (setq cfg-lock-travel (bufget-i16 data 2))
                     (setq cfg-lock-max (bufget-i16 data 4))
                     (setq cfg-lock-damp (bufget-i16 data 6))
+                    (setq cfg-lock-free (bufget-i16 data 8))
                     (lock-set-span)))
             ((= cmd pkt-lock-cmd)
                 (if (= (bufget-u8 data 1) 1)
