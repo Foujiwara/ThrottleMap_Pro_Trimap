@@ -2,6 +2,12 @@ param([string]$VescTool = 'vesc_tool')
 $ErrorActionPreference = 'Stop'
 Push-Location $PSScriptRoot
 try {
+    # Balanced parens are not enough - see tests/check-structure.py.
+    $py = (Get-Command python -ErrorAction SilentlyContinue)
+    if ($py) {
+        & $py.Source (Join-Path $PSScriptRoot 'tests/check-structure.py')
+        if ($LASTEXITCODE -ne 0) { throw 'Lisp structure check failed.' }
+    } else { Write-Warning 'python not found - skipping the lisp structure check.' }
     $versionText = (Get-Content -Raw version).Trim()
     $nameText = (Get-Content -Raw package_name).Trim()
     if ($nameText.Length -gt 20) { $nameText = $nameText.Substring(0, 20) }

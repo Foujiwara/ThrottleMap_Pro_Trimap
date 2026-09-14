@@ -195,12 +195,17 @@
               (if (and (> cfg-lock-timeout 0)
                        (> (secs-since lock-time) cfg-lock-timeout))
                   (lock-stop 1)
+                ; The progn is not decoration: let takes ONE body form, so
+                ; without it the setq runs and the set-current-rel below it
+                ; is silently dropped - the request shows in telemetry and
+                ; the motor never hears about it.
                 (let ((p (clamp-f (/ (* lock-mm 1000) lock-span) -1000 1000))
                       (d (/ (* cfg-lock-damp r) 2000)))
-                    (setq live-cur-rel
-                        (clamp-f (- 0 (+ (/ (* p cfg-lock-max) 1000) d))
-                                 (- 0 cfg-lock-max) cfg-lock-max))
-                    (set-current-rel (fp-to-f live-cur-rel)))))))))
+                    (progn
+                        (setq live-cur-rel
+                            (clamp-f (- 0 (+ (/ (* p cfg-lock-max) 1000) d))
+                                     (- 0 cfg-lock-max) cfg-lock-max))
+                        (set-current-rel (fp-to-f live-cur-rel))))))))))
 
 (defun control-tick ()
     (if (or storage-busy (= pkg-enabled 0))
