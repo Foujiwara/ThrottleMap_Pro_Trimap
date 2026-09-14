@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 17
+    property int buildMarker: 18
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -2110,7 +2110,7 @@ Item {
                             color: lockState === 1 ? "#00e5ff" : "#888"; font.bold: true
                         }
                         Label { text: "Deflection"; color: "#aaa" }
-                        Label { text: lockErr.toFixed(3) + " turns"; color: "#fff" }
+                        Label { text: lockErr.toFixed(3) + " motor turns"; color: "#fff" }
                         Label { text: "Hold current"; color: "#aaa" }
                         Label { text: (liveCurRel * 100).toFixed(1) + " % asked"; color: "#fff" }
                         Label { text: "Motor current"; color: "#aaa" }
@@ -2190,7 +2190,7 @@ Item {
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 2
                         RowLayout { Layout.fillWidth: true
-                            Label { text: "Tolerated travel (turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            Label { text: "Tolerated travel (motor turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
                             TextField {
                                 Layout.preferredWidth: 60
                                 horizontalAlignment: TextInput.AlignRight
@@ -2210,7 +2210,7 @@ Item {
                         }
                     }
                     Label {
-                        text: "Wheel turns it may be pushed through before the hold reaches its current ceiling. Smaller is stiffer; 0 means full current at the first millimetre of movement."
+                        text: "Motor turns it may be pushed through before the hold reaches its current ceiling - the same as wheel turns on a direct drive, divided by the gear ratio otherwise. Smaller is stiffer; 0 means full current at the first millimetre of movement."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
@@ -2269,7 +2269,7 @@ Item {
                     }
 
                     Label {
-                        text: "Position is read from the tachometer, so it is exact at a standstill and never drifts. Turns are scaled with the wheel diameter and gear ratio from your motor configuration - if those are wrong, the numbers are rescaled but the hold itself is unaffected."
+                        text: "Position is read from the tachometer, so it is exact at a standstill and never drifts. The pole count is already applied by the firmware; turns are recovered from the wheel diameter and gear ratio in your motor configuration. If those are wrong the numbers are rescaled, but the hold itself is unaffected."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
