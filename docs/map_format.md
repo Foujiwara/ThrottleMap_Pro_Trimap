@@ -109,10 +109,18 @@ Applied to the brake lever only:
 | 1 | Current, no reverse: signed current while travelling forward, then zero current once the direction latch says it has stopped. The latch is a Schmitt trigger - it engages below 50 ERPM and only releases above 300 - because a single threshold oscillates: the negative current it gates is what drives the speed through it |
 | 2 | Current, bidirectional: signed current throughout, driving on into reverse once stopped |
 
-The command itself follows the **ADC input mode**, not the sign of the
-output: Normal has no brake channel, so a negative map value leaves as
-`set-brake-rel` and can only slow the motor. Double ADC and Bidirectional
-use `set-current-rel` exclusively and never send a brake command.
+The brake type governs **braking requests only**. Braking means torque
+against the way the vehicle is actually moving:
+
+```
+braking = (rpm > 50 and v < 0) or (rpm < -50 and v > 0)
+```
+
+Anything else is propulsion - forwards or backwards - and always leaves as
+`set-current-rel`. Pressing the brake channel at a standstill is a reverse
+request, not a braking one, so it drives out as negative current even in
+regen-only; the brake type only gets a say once that reverse is rolling
+and the map asks to stop it.
 
 Engine braking and overrun regen, which come from the map itself rather
 than from the lever, always stay pure regen whatever this is set to. A

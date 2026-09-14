@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 6
+    property int buildMarker: 7
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -2081,9 +2081,8 @@ Item {
                             : "Off: the brake lever commands a plain proportional brake, unchanged from the stable package. Turn it on to shape braking against speed too."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
-                    // Independent of the input mode: this decides how any
-                    // negative output is commanded, engine braking on a
-                    // released throttle included.
+                    // Only braking requests go through this. Propulsion -
+                    // forwards or backwards - is always relative current.
                     Label { text: "Brake type"; color: "#ccc" }
                     ComboBox {
                         Layout.fillWidth: true
@@ -2094,13 +2093,13 @@ Item {
                         onActivated: (idx) => { cfgBrakeType = idx; sendSetConfig(false) }
                     }
                     Label {
-                        text: ["Regen only: every negative value leaves as a relative brake command, which can only slow the motor and never turn it backwards.",
-                               "Current, no reverse: negative current all the way down to a stop, then zero current instead of reversing. The hold releases only once you are clearly rolling forward again, so it cannot shunt back and forth around standstill.",
-                               "Current, bidirectional: signed current throughout - it decelerates, stops, and drives on into reverse."][cfgBrakeType]
+                        text: ["Regen only: braking leaves as a relative brake command, which opposes rotation by construction. Reversing still uses negative current - asking for reverse is propulsion, not braking.",
+                               "Current, no reverse: braking is torque against the motion, down to a complete stop. This is the one type that refuses to start the vehicle backwards, holding zero instead.",
+                               "Current, bidirectional: braking is torque against the motion, and reverse is allowed - it decelerates, stops and drives on backwards."][cfgBrakeType]
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
                     Label {
-                        text: "Applies in all three input modes, including engine braking with the throttle released in Normal mode."
+                        text: "Braking means torque against the way the vehicle is actually moving, wherever the value comes from: engine braking with the throttle released, overrun regen, the brake channel, or stopping a reverse. Everything else is propulsion and always goes out as relative current."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
