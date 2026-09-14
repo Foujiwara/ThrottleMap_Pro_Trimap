@@ -12,6 +12,13 @@
 set -e
 cd "$(dirname "$0")"
 
+# Balanced parens are not enough - see tests/check-structure.py.
+if command -v python >/dev/null 2>&1; then
+    python tests/check-structure.py || exit 1
+else
+    echo "warning: python not found - skipping the lisp structure check" >&2
+fi
+
 VESC_TOOL="${1:-vesc_tool}"
 VERSION=$(cat version)
 PACKAGE_NAME=$(cut -c-20 package_name)
