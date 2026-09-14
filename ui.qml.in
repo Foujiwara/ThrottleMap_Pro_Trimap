@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 11
+    property int buildMarker: 12
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -374,6 +374,11 @@ Item {
     property bool cfgReceived: false
     property var rowSeen: []
     property double lastLiveTime: 0
+    // Read-back is retried from the 20 Hz live handler. Unthrottled, a
+    // read-back that keeps failing re-queues the whole map twenty times a
+    // second, which saturates the link and takes the interface down with
+    // it - the failure looks like a frozen UI rather than a failed read.
+    property double lastAutoReq: 0
     property real benchValue: 0
     onThrSourceChanged: benchValue = 0
 
@@ -394,6 +399,7 @@ Item {
     function failTransfer(message) {
         commandTimeout.stop(); pendingPacket = null; txQueue = []
         mapReceived = false; cfgReceived = false
+        lastAutoReq = Date.now()
         lastCmdStatus = message
     }
     Timer { id: commandTimeout; interval: 20000; onTriggered: failTransfer("Command timed out; read back before retrying") }
@@ -427,7 +433,11 @@ Item {
         if (cmd === rxLive) {
             if (view.byteLength !== 23) return
             lastLiveTime = Date.now()
-            if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0) { requestMap(); requestCfg() }
+            if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0
+                    && Date.now() - lastAutoReq > 2000) {
+                lastAutoReq = Date.now()
+                requestMap(); requestCfg()
+            }
             liveThrottle = fxDec(view.getInt16(1, false))
             liveDuty = fxDec(view.getInt16(3, false))
             liveErpm = view.getInt32(5, false)
