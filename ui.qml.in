@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 22
+    property int buildMarker: 23
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -387,6 +387,12 @@ Item {
     // whatever happens to be in the controller's RAM.
     property bool autoLoadDone: false
     property bool autoLoadPending: false
+    // Rows land here during a read-back and are published to mapData once,
+    // at the end. Assigning mapData per row repainted all 451 cells 31
+    // times while packets were still arriving 5 ms apart, and rows were
+    // being dropped in the gaps.
+    property var mapScratch: []
+    property int mapRetries: 0
     property real benchValue: 0
     onThrSourceChanged: benchValue = 0
 
@@ -400,7 +406,9 @@ Item {
     function pumpTx() {
         if (pendingPacket !== null || txQueue.length === 0) return
         pendingPacket = txQueue.shift()
-        if (pendingPacket[0] === cmdReqMap) { rowSeen = []; mapReceived = false }
+        if (pendingPacket[0] === cmdReqMap) {
+            rowSeen = []; mapReceived = false; mapScratch = mapData.slice()
+        }
         // A read-back is 31 packets and ~150 ms of pacing; if it goes
         // unanswered it was dropped, not slow. Waiting 20 s to find that
         // out is what made the first load feel like it hung - only the
@@ -413,6 +421,7 @@ Item {
     function failTransfer(message) {
         commandTimeout.stop(); pendingPacket = null; txQueue = []
         mapReceived = false; cfgReceived = false
+        mapRetries = 0
         lastAutoReq = Date.now()
         lastCmdStatus = message
     }
@@ -491,10 +500,11 @@ Item {
             // A 31-bit mask would overflow a JS bitwise int, so count the
             // rows in a plain array instead.
             rowSeen[row] = true
-            var arr = mapData.slice()
+            // Into the scratch buffer, with no property assignment: this
+            // runs between two packets 5 ms apart and must not repaint.
+            if (mapScratch.length !== mapCells) mapScratch = mapData.slice()
             for (var d = 0; d < mapRowCols(row); d++)
-                arr[cellIdx(row, d)] = fxDec(view.getInt16(2 + d * 2, false))
-            mapData = arr
+                mapScratch[cellIdx(row, d)] = fxDec(view.getInt16(2 + d * 2, false))
         } else if (cmd === rxStatus) {
             // Separate from statusText on purpose: that one doubles as
             // the connection indicator and gets overwritten back to
@@ -525,7 +535,23 @@ Item {
                 var got = 0
                 for (var r = 0; r < mapThrN; r++) if (rowSeen[r]) got++
                 mapReceived = got === mapThrN
-                if (!mapReceived) { failTransfer("Incomplete map received"); return }
+                if (!mapReceived) {
+                    // A dropped row is a link hiccup, not a broken map. Ask
+                    // again rather than throwing the whole read-back away -
+                    // giving up left the grid drawn as zeros with no way
+                    // back except a manual Load.
+                    pendingPacket = null
+                    if (mapRetries < 3) {
+                        mapRetries++
+                        lastCmdStatus = "Missing " + (mapThrN - got) + " rows, retrying (" + mapRetries + "/3)"
+                        requestMap()
+                        return
+                    }
+                    failTransfer("Incomplete map: " + got + "/" + mapThrN + " rows")
+                    return
+                }
+                mapRetries = 0
+                mapData = mapScratch
             }
             if (code > 0) lastCmdStatus = ["OK", "Map and settings saved and verified", "Map loaded", "Reset to defaults"][code]
             pendingPacket = null
