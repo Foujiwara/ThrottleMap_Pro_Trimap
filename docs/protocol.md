@@ -11,7 +11,7 @@ Map cells and throttle calibration use that same integer scale internally.
 | --- | --- | --- |
 | 01 | SET_CELL | 5: row:u8 col:u8 value:i16 - col must be inside that row own column count |
 | 02 | SET_MAP_ROW | 44: row:u8 and 21 values:i16; only that row own columns are read, the tail is padding |
-| 03 | SET_CONFIG | 35: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 rev_erpm:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 rev_coupling:i16 rev_width:i16 rev_overrun:i16 |
+| 03 | SET_CONFIG | 44: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 rev_erpm:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 rev_coupling:i16 rev_width:i16 rev_overrun:i16 rev_str:i16 rev_resp:i16 rev_hold:i16 rev_shape:u8 rev_curve:u8 regen_rev:u8 |
 | 04 | SET_THROTTLE | 12: source:u8 invert:u8 min:i16 max:i16 deadband:i16 filter:i16 brake_mode:u8 |
 | 05 | SAVE | 1 |
 | 06 | LOAD | 1 |
@@ -20,11 +20,12 @@ Map cells and throttle calibration use that same integer scale internally.
 | 09 | REQUEST_CFG | 1 |
 | 0A | SET_TEST_THROTTLE | 3: value:i16, -1000..1000 (negative is a brake request) |
 
-There are two independent regenerate flags. `regenerate` rebuilds throttle
-rows 10..30 from the thermal parameters; `regen_brake` rebuilds brake rows
-0..9 from the brake_* fields. The rev_* fields rebuild nothing: they are
-generator settings for the left half of the brake rows. Neither touches the
-other half, so shaping one never discards hand edits made to the other.
+There are three independent regenerate flags, one per region of the graph.
+`regenerate` rebuilds throttle rows 10..30 from the thermal parameters (and
+seeds row 10's negative-duty half); `regen_brake` rebuilds the brake rows'
+positive-duty columns from the brake_* fields; `regen_rev` rebuilds their
+negative-duty columns from the rev_* fields. None of the three touches
+another's cells, so shaping one never discards hand edits made elsewhere.
 Either flag also separates generator action from preset identity: 1
 regenerates even for Custom (preset 0), 0 preserves the current map even
 when importing a named preset.
@@ -47,13 +48,14 @@ the throttle. min must be below max.
 | 80 | LIVE | 15: throttle:i16 duty:i16 erpm:i32 current_rel:i16 current_A:i16 brake:i16 |
 | 81 | MAP_ROW | 44: row:u8 and 21 values:i16; padding past a row own columns is sent as zero |
 | 82 | STATUS | 3: status:u8 original_command:u8 |
-| 83 | CFG_ECHO | 44: config fields, throttle fields, brake map:u8 brake type:u8 rev erpm:i16, then brake str:i16 brake resp:i16 brake dep:i16 brake curve:u8 rev coupling:i16 rev width:i16 rev overrun:i16 |
+| 83 | CFG_ECHO | 52: config fields, throttle fields, brake map:u8 brake type:u8 rev erpm:i16, then the brake and reverse generator fields in the same order as SET_CONFIG |
 
 Status: 0 OK, 1 saved and verified, 2 loaded, 3 reset, 4 save failed,
 5 no valid saved image, 6 invalid packet, 7 command execution failed.
 REQUEST_MAP/REQUEST_CFG send their payloads before status 0.
-Row indices run 0..30: rows 0..9 are brake levers with 21 duty columns
-(-100%..+100%), rows 10..30 are throttle with 11 (0..100%). Use matching QML/Lisp components: the queue requires correlated
+Row indices run 0..30: rows 0..10 are brake levers with 21 duty columns
+(-100%..+100%), rows 11..30 are throttle with 11 (0..100%). Row 10 is the
+released row and belongs to the 21-column group. Use matching QML/Lisp components: the queue requires correlated
 three-byte statuses and will time out with an older controller script.
 
 QML allows one queued command in flight with a 20-second timeout and verifies

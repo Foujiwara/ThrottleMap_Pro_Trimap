@@ -5,35 +5,39 @@
 ; for traction, duty is speed and its sign does not matter, so the negative
 ; side is the positive side mirrored.
 ;
-;   rows 0..9   brake levers -100%..-10%, 10% steps, 21 duty columns
-;               spanning -100%..+100% - braking against speed on the right,
-;               reverse on the left
-;   rows 10..30 throttle 0..100%, 5% steps, 11 duty columns spanning
+;   rows 0..10  brake levers -100%..0, 10% steps, 21 duty columns spanning
+;               -100%..+100% - braking against speed on the right, reverse
+;               on the left. Row 10 is the released row, so its left half is
+;               engine braking while rolling backwards, editable on its own.
+;   rows 11..30 throttle 5..100%, 5% steps, 11 duty columns spanning
 ;               0..100%, read mirrored for negative duty
 ;
-; 10*21 + 21*11 = 441 cells, the same budget a 21x21 grid would have used.
+; 11*21 + 20*11 = 451 cells. That fills the EEPROM exactly: 126 of the 127
+; data slots, with slot 127 holding the CRC.
 @const-start
 (define map-thr-n 31)
 (define map-duty-n 21)
 (define map-thr-zero 10)
-(define map-brake-cells 210)
-(define map-cells 441)
+(define map-cells 451)
 @const-end
 (define map-buf (array-create map-cells))
 @const-start
 ; Columns a given row actually stores.
-(defun map-row-cols (t-i) (if (< t-i 10) 21 11))
+(defun map-row-cols (t-i) (if (<= t-i 10) 21 11))
 (defun map-idx (t-i d-i)
-    (if (< t-i 10)
+    (if (<= t-i 10)
         (+ (* t-i 21) d-i)
-        (+ 210 (* (- t-i 10) 11) d-i)))
+        (+ 231 (* (- t-i 11) 11) d-i)))
 (defun map-get-cell (t-i d-i) (* (bufget-i8 map-buf (map-idx t-i d-i)) 10))
 (defun map-set-cell (t-i d-i val)
     (bufset-i8 map-buf (map-idx t-i d-i) (cell-to-i8 val)))
 
-; Zero lever is not stored: it is zero by definition, and having it lets a
-; light pull fade in from nothing instead of jumping to the -10% row.
-(defun map-brake-get (p d-i) (if (= p 0) 0 (map-get-cell (- 10 p) d-i)))
+; Zero lever is row 10, the released row, so a light pull fades in from
+; whatever engine braking is doing rather than from nothing.
+(defun map-brake-get (p d-i) (map-get-cell (- 10 p) d-i))
+; Row 10 stores the full 21 columns, so forward duty sits at 10 + d there.
+(defun map-drive-get (t-i d-i)
+    (map-get-cell t-i (if (= t-i 10) (+ d-i 10) d-i)))
 
 ; ---- lookup --------------------------------------------------------------
 ; Both halves interpolate on their own uniform grid; nothing ever needs to
@@ -61,8 +65,8 @@
           (t0 (min-f (+ 10 (/ tf 1000)) 30)) (d0 (min-f (/ df 1000) 10))
           (t1 (min-f (+ t0 1) 30)) (d1 (min-f (+ d0 1) 10))
           (tw (mod tf 1000)) (dw (mod df 1000))
-          (v00 (map-get-cell t0 d0)) (v01 (map-get-cell t0 d1))
-          (v10 (map-get-cell t1 d0)) (v11 (map-get-cell t1 d1))
+          (v00 (map-drive-get t0 d0)) (v01 (map-drive-get t0 d1))
+          (v10 (map-drive-get t1 d0)) (v11 (map-drive-get t1 d1))
           (v0 (+ v00 (/ (* (- v01 v00) dw) 1000)))
           (v1 (+ v10 (/ (* (- v11 v10) dw) 1000))))
         (+ v0 (/ (* (- v1 v0) tw) 1000))))
@@ -101,45 +105,50 @@
                         (+ 1.0 curve))))))))))
 
 (defun gen-thermal-map (response coupling width shape hold brake overrun curve)
-    (looprange ti 0 21
-        (let ((thr (/ ti 20.0))
-              (peak (thermal-peak thr response hold))
-              (balance (clamp01 (* thr coupling))))
-            (looprange di 0 11
-                (map-set-cell (+ ti 10) di
-                    (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
-                                        width shape brake overrun curve)))))))
+    (progn
+        (looprange ti 0 21
+            (let ((thr (/ ti 20.0))
+                  (peak (thermal-peak thr response hold))
+                  (balance (clamp01 (* thr coupling))))
+                (looprange di 0 11
+                    (map-set-cell (+ ti 10) (if (= ti 0) (+ di 10) di)
+                        (to-fp (thermal-cell thr (/ di 10.0) peak balance coupling
+                                            width shape brake overrun curve))))))
+        ; Released row, negative duty: engine braking while rolling
+        ; backwards. Seeded as the mirror, editable on its own from there.
+        (looprange di 0 10
+            (map-set-cell 10 di
+                (to-fp (thermal-cell 0.0 (/ (- 10 di) 10.0) 0.0 0.0 coupling
+                                    width shape brake overrun curve))))))
 
-; Brake rows. Forward duty carries braking against speed; negative duty
-; carries reverse, with the traction law's shape mirrored onto it.
-;   peak    = strength * lever ^ response
-;   forward : -(peak * ((1 - dep) + dep * duty ^ (1 + curve)))
-;   reverse : balance = clamp(lever * rev_coupling); below it -peak,
-;             tapering to zero at balance, then positive - forward torque,
-;             which holds a reverse that is running away.
-(defun brake-cell (b duty strength resp dep curve rcoup rwidth rover)
-    (let ((peak (* strength (pow b resp))))
-        (if (> duty 0.0)
-            (- (* peak (clamp01 (+ (- 1.0 dep) (* dep (pow duty (+ 1.0 curve)))))))
-            (if (= rcoup 0.0)
-                (- peak)
-                (let ((rev (- duty))
-                      (balance (clamp01 (* b rcoup))))
-                    (let ((start (clamp01 (- balance rwidth))))
-                        (cond
-                            ((<= rev start) (- peak))
-                            ((<= rev balance)
-                                (- (* peak (- 1.0 (shape-curve
-                                    (/ (- rev start) (max-f 0.001 (- balance start))) 1)))))
-                            (t (* rover (pow
-                                (clamp01 (/ (- rev balance) (max-f 0.001 (- 1.0 balance))))
-                                2.0))))))))))
+; Brake rows split into their two halves, each with its own regenerate
+; flag so shaping one never discards hand edits made to the other. Both
+; read the cfg-* globals directly rather than taking a dozen arguments.
 
-(defun gen-brake-map (strength resp dep curve rcoup rwidth rover)
+; Right half (duty > 0): braking against forward speed.
+;   -(strength * lever^response * ((1 - dep) + dep * duty^(1 + curve)))
+(defun brake-speed (duty)
+    (clamp01 (+ (- 1.0 cfg-brake-dep)
+                (* cfg-brake-dep (pow duty (+ 1.0 cfg-brake-curve))))))
+
+(defun gen-brake-half ()
+    (looprange bi 0 10
+        (let ((peak (* cfg-brake-str (pow (/ (- 10 bi) 10.0) cfg-brake-resp))))
+            (looprange di 11 21
+                (map-set-cell bi di
+                    (to-fp (- (* peak (brake-speed (/ (- di 10) 10.0))))))))))
+
+; Left half (duty <= 0): reverse, which is the traction law negated - same
+; peak/balance/taper/overrun shape, its own eight settings.
+(defun gen-rev-half ()
     (looprange bi 0 10
         (let ((b (/ (- 10 bi) 10.0)))
-            (looprange di 0 21
-                (map-set-cell bi di
-                    (to-fp (brake-cell b (/ (- di 10) 10.0)
-                                       strength resp dep curve rcoup rwidth rover)))))))
+            (let ((peak (* cfg-rev-str (thermal-peak b cfg-rev-resp cfg-rev-hold)))
+                  (balance (clamp01 (* b cfg-rev-coupling))))
+                (looprange di 0 11
+                    (let ((rev (/ (- 10 di) 10.0)))
+                        (map-set-cell bi di
+                            (to-fp (- (thermal-cell b rev peak balance
+                                        cfg-rev-coupling cfg-rev-width cfg-rev-shape
+                                        0.0 cfg-rev-overrun cfg-rev-curve))))))))))
 @const-end

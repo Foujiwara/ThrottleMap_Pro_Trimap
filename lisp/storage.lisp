@@ -1,18 +1,19 @@
-; EEPROM image for the ragged 441-cell map. The header is packed (i16
-; scaled by 1000 instead of f32) to make room: 36 bytes of header + 444
-; bytes of cells + a 14-byte generator tail = 124 of the 127 data slots,
-; and slot 127 holds CRC16 of slots 0..126.
+; EEPROM image for the ragged 451-cell map. The header is packed (i16
+; scaled by 1000 instead of f32) to make room: 36 bytes of header + 452
+; bytes of cells + a 20-byte generator tail = 126 of the 127 data slots,
+; and slot 127 holds CRC16 of slots 0..126. That is the whole store: there
+; is no spare slot left for another field.
 ; Images written by the 21x21 packages are migrated on read, never written.
 ; Earlier beta formats are rejected outright - their geometry differs, and
 ; a wrong reading would be worse than falling back to defaults.
 (define storage-busy nil)
 
 @const-start
-(define eeprom-magic 20260918)
+(define eeprom-magic 20260920)
 (define eeprom-legacy-magic 20260913)
 (define eeprom-legacy-magic0 20260912)
 (define eeprom-map-base 36)
-(define eeprom-map-slots 111)
+(define eeprom-map-slots 113)
 
 ; Avoid firmware versions where bufget-i32 narrows to a 28-bit fixnum.
 (defun storage-buffer-i32 (b offset) (to-i32 (bufget-u32 b offset)))
@@ -48,15 +49,20 @@
         (bufset-u8 b 30 cfg-brake-map)
         (bufset-u8 b 31 cfg-brake-type)
         (bufset-i16 b 32 cfg-rev-erpm)
+        (bufset-u8 b 34 cfg-rev-shape)
+        (bufset-u8 b 35 cfg-rev-curve)
         ; Brake generator lives past the map so a 20260914 image stays a
         ; readable prefix of this one.
-        (bufset-i16 b 480 (to-fp cfg-brake-str))
-        (bufset-i16 b 482 (to-fp cfg-brake-resp))
-        (bufset-i16 b 484 (to-fp cfg-brake-dep))
-        (bufset-u8 b 486 cfg-brake-curve)
-        (bufset-i16 b 488 (to-fp cfg-rev-coupling))
-        (bufset-i16 b 490 (to-fp cfg-rev-width))
-        (bufset-i16 b 492 (to-fp cfg-rev-overrun))
+        (bufset-i16 b 488 (to-fp cfg-brake-str))
+        (bufset-i16 b 490 (to-fp cfg-brake-resp))
+        (bufset-i16 b 492 (to-fp cfg-brake-dep))
+        (bufset-u8 b 494 cfg-brake-curve)
+        (bufset-i16 b 496 (to-fp cfg-rev-coupling))
+        (bufset-i16 b 498 (to-fp cfg-rev-width))
+        (bufset-i16 b 500 (to-fp cfg-rev-overrun))
+        (bufset-i16 b 502 (to-fp cfg-rev-str))
+        (bufset-i16 b 504 (to-fp cfg-rev-resp))
+        (bufset-i16 b 506 (to-fp cfg-rev-hold))
         (looprange s 0 eeprom-map-slots
             (bufset-u32 b (+ eeprom-map-base (* s 4))
                 (pack4 (map-cell-flat-i8 (* s 4))
@@ -141,13 +147,18 @@
 
 (defun storage-tail-valid (b)
     (and
-        (in-range (bufget-i16 b 480) 0 1000)
-        (in-range (bufget-i16 b 482) 300 2000)
-        (in-range (bufget-i16 b 484) 0 1000)
-        (in-range (bufget-u8 b 486) 0 3)
-        (in-range (bufget-i16 b 488) 0 1500)
-        (in-range (bufget-i16 b 490) 20 300)
-        (in-range (bufget-i16 b 492) 0 500)))
+        (in-range (bufget-u8 b 34) 0 3)
+        (in-range (bufget-u8 b 35) 0 3)
+        (in-range (bufget-i16 b 488) 0 1000)
+        (in-range (bufget-i16 b 490) 300 2000)
+        (in-range (bufget-i16 b 492) 0 1000)
+        (in-range (bufget-u8 b 494) 0 3)
+        (in-range (bufget-i16 b 496) 0 1500)
+        (in-range (bufget-i16 b 498) 20 300)
+        (in-range (bufget-i16 b 500) 0 500)
+        (in-range (bufget-i16 b 502) 0 1000)
+        (in-range (bufget-i16 b 504) 300 2000)
+        (in-range (bufget-i16 b 506) 0 1000)))
 
 (defun storage-brake-defaults ()
     (progn
@@ -155,9 +166,14 @@
         (setq cfg-brake-resp 1.0)
         (setq cfg-brake-dep 0.0)
         (setq cfg-brake-curve 0)
+        (setq cfg-rev-str 1.0)
+        (setq cfg-rev-resp 1.0)
+        (setq cfg-rev-hold 0.0)
         (setq cfg-rev-coupling 1.0)
         (setq cfg-rev-width 0.10)
-        (setq cfg-rev-overrun 0.12)))
+        (setq cfg-rev-shape 1)
+        (setq cfg-rev-overrun 0.12)
+        (setq cfg-rev-curve 1)))
 
 (defun storage-apply-image (b)
     (progn
@@ -180,13 +196,18 @@
         (setq cfg-brake-map (bufget-u8 b 30))
         (setq cfg-brake-type (bufget-u8 b 31))
         (setq cfg-rev-erpm (bufget-i16 b 32))
-        (setq cfg-brake-str (fp-to-f (bufget-i16 b 480)))
-        (setq cfg-brake-resp (fp-to-f (bufget-i16 b 482)))
-        (setq cfg-brake-dep (fp-to-f (bufget-i16 b 484)))
-        (setq cfg-brake-curve (bufget-u8 b 486))
-        (setq cfg-rev-coupling (fp-to-f (bufget-i16 b 488)))
-        (setq cfg-rev-width (fp-to-f (bufget-i16 b 490)))
-        (setq cfg-rev-overrun (fp-to-f (bufget-i16 b 492)))
+        (setq cfg-rev-shape (bufget-u8 b 34))
+        (setq cfg-rev-curve (bufget-u8 b 35))
+        (setq cfg-brake-str (fp-to-f (bufget-i16 b 488)))
+        (setq cfg-brake-resp (fp-to-f (bufget-i16 b 490)))
+        (setq cfg-brake-dep (fp-to-f (bufget-i16 b 492)))
+        (setq cfg-brake-curve (bufget-u8 b 494))
+        (setq cfg-rev-coupling (fp-to-f (bufget-i16 b 496)))
+        (setq cfg-rev-width (fp-to-f (bufget-i16 b 498)))
+        (setq cfg-rev-overrun (fp-to-f (bufget-i16 b 500)))
+        (setq cfg-rev-str (fp-to-f (bufget-i16 b 502)))
+        (setq cfg-rev-resp (fp-to-f (bufget-i16 b 504)))
+        (setq cfg-rev-hold (fp-to-f (bufget-i16 b 506)))
         (looprange i 0 map-cells
             (bufset-i8 map-buf i (storage-image-cell b i)))
         (thr-reset-state)
@@ -241,10 +262,11 @@
         (storage-brake-defaults)
         (looprange ti 0 21
             (looprange di 0 11
-                (bufset-i8 map-buf (map-idx (+ ti map-thr-zero) di)
-                    (storage-cell-at b 60 (+ (* ti 21) (* di 2))))))
-        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve
-                       cfg-rev-coupling cfg-rev-width cfg-rev-overrun)
+                (map-set-cell (+ ti map-thr-zero)
+                    (if (= ti 0) (+ di 10) di)
+                    (i8-to-cell (storage-cell-at b 60 (+ (* ti 21) (* di 2)))))))
+        (gen-brake-half)
+        (gen-rev-half)
         (thr-reset-state)
         t))
 
@@ -308,7 +330,7 @@
         (gen-thermal-map cfg-torque-resp cfg-speed-coupling cfg-trans-width
                          cfg-trans-shape cfg-high-hold cfg-engine-brake
                          cfg-overrun-regen cfg-regen-curve)
-        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep cfg-brake-curve
-                       cfg-rev-coupling cfg-rev-width cfg-rev-overrun)
+        (gen-brake-half)
+        (gen-rev-half)
         t))
 @const-end

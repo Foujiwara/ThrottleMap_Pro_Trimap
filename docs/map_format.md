@@ -9,21 +9,23 @@ negative side is the positive side mirrored.
 
 | Rows | Throttle | Columns | Duty |
 | --- | --- | --- | --- |
-| 0..9 | brake lever -100%..-10%, 10% steps | 21 | -100%..+100%, 10% steps |
-| 10..30 | throttle 0..100%, 5% steps | 11 | 0..100%, 10% steps, read mirrored for negative duty |
+| 0..10 | brake lever -100%..0, 10% steps | 21 | -100%..+100%, 10% steps |
+| 11..30 | throttle 5..100%, 5% steps | 11 | 0..100%, 10% steps, read mirrored for negative duty |
 
-`10*21 + 21*11 = 441` cells - the same budget a 21x21 grid would have
-used, but the traction half keeps its 5% throttle steps and the brake half
-gains a full reverse region. Each cell is a signed byte in -100..100,
+`11*21 + 20*11 = 451` cells. Each is a signed byte in -100..100,
 representing -1.00..1.00 at 1% resolution. The buffer is mutable RAM,
 never constant flash.
 
-Row 10 is zero throttle. Zero lever is not stored: it is zero by
-definition, and having it as an implicit row lets a light pull fade in
-from nothing instead of jumping to the -10% row.
+Row 10 is both zero throttle and zero lever, and stores the full 21
+columns. Its right half is engine braking against forward speed; its left
+half is engine braking while rolling backwards, editable independently.
+Being a real row rather than an implicit zero also means a light pull on
+the lever fades in from whatever engine braking is doing, not from
+nothing.
 
-Every view draws 21 display columns per row; on a traction row the two
-halves are the same cells, so editing one edits the other.
+Every view draws 21 display columns per row. On a throttle row (11..30)
+the left half is only a mirror of the right, so it is drawn dimmed and
+editing either side edits the same cell.
 
 ## Lookup
 
@@ -33,7 +35,8 @@ across the seam, since throttle and brake are separate inputs.
 - **throttle >= 0**: rows 10..30 against `|duty|`, so rolling backwards
   reads the same curve as rolling forwards at that speed. Engine braking
   and the balance point therefore work in both directions, and nothing is
-  discontinuous through zero.
+  discontinuous through zero. Row 10 stores 21 columns, so its forward
+  duty sits at `10 + d` - `map-drive-get` handles that.
 - **throttle < 0**: the brake rows against signed duty -1000..1000.
 
 Positive values command relative propulsion current, negative values
@@ -49,27 +52,36 @@ it and overrun regen after. The released row uses
 `-engine_brake * duty ^ (1 + regen_curve)`. Zero speed coupling selects
 duty-independent torque (Direct Electric). QML previews the same formula.
 
-Brake rows have their own generator and their own regenerate flag, so
-neither half can overwrite the other:
+There are **three generators**, one per region of the graph, each with its
+own regenerate flag so shaping one never discards hand edits made to
+another:
+
+1. **Traction** - rows 10..30, the thermal law above. It also seeds row
+   10's negative-duty half with the mirrored engine-braking curve.
+2. **Brake** - brake rows, duty > 0. A plateau by default:
 
 ```
-peak    = brake_strength * lever ^ brake_response
-
-duty > 0  (braking against speed)
-    -(peak * ((1 - duty_dep) + duty_dep * duty ^ (1 + brake_curve)))
-
-duty <= 0 (reverse)
-    balance = clamp01(lever * rev_coupling)
-    start   = clamp01(balance - rev_width)
-    rev <= start    : -peak
-    rev <= balance  : -peak * (1 - p^2)
-    rev >  balance  : +rev_overrun * over^2
+-(brake_strength * lever^brake_response
+  * ((1 - duty_dep) + duty_dep * duty^(1 + brake_curve)))
 ```
 
-Defaults 1.0 / 1.0 / 0.0 / 0 and 1.0 / 0.10 / 0.12: -10% lever is -0.10 at
-any forward speed, and backs up to 10% duty before it stops pulling.
-`duty_dep` fades braking out towards a standstill; `rev_coupling = 0`
-removes the reverse balance.
+3. **Reverse** - brake rows, duty <= 0. The traction law **negated**, with
+   its own eight settings, over reverse duty. `gen-rev-half` literally
+   calls `thermal-cell` and negates the result, so the two regions cannot
+   drift apart:
+
+```
+peak    = rev_strength * thermal_peak(lever, rev_response, rev_hold)
+balance = clamp01(lever * rev_coupling)
+cell    = -thermal_cell(lever, rev, peak, balance, rev_coupling,
+                        rev_width, rev_shape, 0, rev_overrun, rev_curve)
+```
+
+Brake defaults 1.0 / 1.0 / 0.0 / 0 give -10% lever = -0.10 at any forward
+speed. Reverse defaults 1.0 / 1.0 / 0.0 / 1.0 / 0.10 / squared / 0.12 /
+progressive give -30% lever backing up to 30% duty and then holding
+there. `duty_dep` fades braking out towards a standstill;
+`rev_coupling = 0` removes the reverse balance and leaves a plateau.
 
 The positive cells past the reverse balance are forward torque, which
 holds a reverse that is running away. Only a bidirectional brake reaches
@@ -93,7 +105,7 @@ merely released.
 
 ## EEPROM layout
 
-There are 128 persistent 32-bit slots. Format marker 20260918. The header
+There are 128 persistent 32-bit slots. Format marker 20260920. The header
 is packed into 9 slots (i16 scaled by 1000 instead of float32) and the
 generator settings sit in a tail after the map.
 
@@ -108,11 +120,15 @@ generator settings sit in a tail after the map.
 | 24, 26 | Engine brake, overrun regen |
 | 28..31 | Transition shape, regen curve, brake map on, brake type (u8 each) |
 | 32 | Reverse-threshold ERPM, i16 |
-| 36..479 | Four map bytes per word; first cell in least significant byte |
-| 480..492 | Brake strength, response, speed dependence (i16 x1000), speed curve (u8), then reverse coupling, width, overrun (i16 x1000) |
+| 34, 35 | Reverse transition shape, reverse runaway curve (u8 each) |
+| 36..487 | Four map bytes per word; first cell in least significant byte |
+| 488..494 | Brake strength, response, speed dependence (i16 x1000), speed curve (u8) |
+| 496..507 | Reverse coupling, width, overrun, strength, response, hold (i16 x1000) |
 | Slot 127 | CRC16 of slots 0..126 encoded as big-endian words |
 
-That is 124 of the 127 data slots; the remaining ones are written as zero.
+That is **all 126 usable data slots**, with slot 127 holding the CRC.
+The store is full: another setting would have to replace an existing one,
+or cost map cells.
 
 Each cell is stored as signed_value + 128. Padding cells in the last slot
 represent zero. Packing promotes to u32 **before** shifts; ordinary Lisp
