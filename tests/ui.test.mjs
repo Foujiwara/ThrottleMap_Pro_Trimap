@@ -42,14 +42,14 @@ const state={console,ArrayBuffer,DataView,Date,Math,Array,isFinite,Error,
  liveThrottle:0,liveDuty:0,liveErpm:0,liveCurRel:0,liveCurA:0,liveBrake:0,
  liveAdcVoltage:0,liveRpmFast:0,pkgEnabled:1,lockState:0,lockReason:0,lockErr:0,
  scriptBooting:false,autoLoadDone:false,autoLoadPending:false,
- mapRetries:0,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
+ mapScratch:[],mapRowsSeen:0,mapRetries:0,mapMaxRetries:5,clearArmed:false,lockTimeout:60,lockTravel:0.25,lockMax:0.15,lockDamp:0.3,lockFree:0,
  cmdSetCell:1,cmdSetMapRow:2,cmdSetConfig:3,cmdSetThr:4,cmdSave:5,cmdLoad:6,cmdReset:7,
  cmdReqMap:8,cmdReqCfg:9,cmdSetTestThr:10,cmdCalibrateBidir:11,cmdSetEnabled:12,
- cmdSetLock:13,cmdLockCmd:14,rxLive:128,rxMapRow:129,rxStatus:130,rxCfgEcho:131};
+ cmdSetLock:13,cmdLockCmd:14,cmdClear:15,rxLive:128,rxMapRow:129,rxStatus:130,rxCfgEcho:131};
 vm.createContext(state);
 for(const name of ['validateImport','quantizeCell','mapRowCols','cellIdx','getCell','fxEnc','fxDec',
  'i16Bytes','transmitPacket','sendPacket','pumpTx','failTransfer','sendSetCell','sendSetMapRow',
- 'sendAllRows','sendSetConfig','sendSetThrottle','sendLockCfg','sendSave','sendLoad','sendReset',
+ 'sendAllRows','sendSetConfig','sendSetThrottle','sendLockCfg','sendSave','sendLoad','sendReset','sendClear',
  'requestMap','requestCfg','sendTestThrottle','handleRx','thermalPeak','shapeCurve',
  'regenerateLocalMap','regenerateLocalBrake','regenerateLocalRev']) {
  vm.runInContext(extract(name),state);
@@ -172,24 +172,41 @@ state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];state.mapRetries=0;
 state.mapData=Array(451).fill(0);
 state.requestMap();
 for(let r=0;r<31;r++)state.handleRx(rowPacket(r,250));
+// Nothing reaches mapData mid-read: reassigning it per row repaints all 451
+// cells while the next packet is already arriving, which is where the top
+// rows of the grid were being lost.
+assert.deepEqual(state.mapData,Array(451).fill(0),'nothing is published mid-read');
+// The count is driven by the rows themselves, not sampled at 20 Hz by the
+// telemetry handler - sampling froze it at whatever number it last caught.
+assert.equal(state.mapRowsSeen,31);
+assert.match(state.lastCmdStatus,/31\/31 rows/);
 ack();
 assert.equal(state.mapReceived,true);
-assert.equal(state.mapData[0],0.25,'every row lands in the right cells');
-assert.equal(state.mapData[450],0.25);
-// The progress label is sampled at 20 Hz and can only catch a few points of
-// a 250 ms read. It must be replaced when the read ends, or it freezes at
-// whatever count the last sample caught and reads as a stall.
-assert.doesNotMatch(state.lastCmdStatus,/Reading/,'progress must not outlive the read');
-assert.match(state.lastCmdStatus,/read from the controller/);
+assert.equal(state.mapData[0],0.25,'the buffer is published on completion');
+assert.equal(state.mapData[450],0.25,'including the last row');
+assert.match(state.lastCmdStatus,/Map read: 31\/31/);
+
+// A duplicate row must not be counted twice.
+state.pendingPacket=null;state.txQueue=[];state.requestMap();
+state.handleRx(rowPacket(0,100));state.handleRx(rowPacket(0,100));
+assert.equal(state.mapRowsSeen,1,'a repeated row counts once');
 
 // A dropped row is a link hiccup, not a broken map: ask again. Giving up at
 // the first miss left the grid drawn as zeros with no way back but a manual
 // Load.
 state.pendingPacket=null;state.txQueue=[];state.rowSeen=[];state.mapRetries=0;
+const before=state.mapData.slice();
 state.requestMap();
-ack();assert.match(state.lastCmdStatus,/retrying \(1\/3\)/);
+ack();assert.match(state.lastCmdStatus,/retrying \(1\/5\)/);
 assert.equal(state.pendingPacket[0],state.cmdReqMap);
-ack();ack();
+ack();ack();ack();ack();
 assert.equal(state.mapReceived,false);
 ack();assert.match(state.lastCmdStatus,/Incomplete/);
+// A partial map is never published: a hole drawn as zeros is
+// indistinguishable from a real cell value.
+assert.deepEqual(state.mapData,before,'a failed read leaves the grid alone');
+
+// ---- clear ---------------------------------------------------------------
+sent.length=0;state.pendingPacket=null;state.txQueue=[];
+state.sendClear();assert.deepEqual(Array.from(sent[0]),[15]);
 console.log('QML JavaScript regression tests passed');

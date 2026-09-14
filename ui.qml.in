@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 24
+    property int buildMarker: 25
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -56,6 +56,7 @@ Item {
     readonly property int cmdSetEnabled: 0x0C
     readonly property int cmdSetLock:    0x0D
     readonly property int cmdLockCmd:    0x0E
+    readonly property int cmdClear:      0x0F
 
     readonly property int rxLive:    0x80
     readonly property int rxMapRow:  0x81
@@ -362,6 +363,7 @@ Item {
         sendSetConfig(false); sendSetThrottle(); sendAllRows(); sendPacket([cmdSave])
     }
     function sendLoad()  { sendPacket([cmdLoad]) }
+    function sendClear() { sendPacket([cmdClear]) }
     function sendReset() { sendPacket([cmdReset]) }
     function requestMap() { sendPacket([cmdReqMap]) }
     function requestCfg() { sendPacket([cmdReqCfg]) }
@@ -387,7 +389,16 @@ Item {
     // whatever happens to be in the controller's RAM.
     property bool autoLoadDone: false
     property bool autoLoadPending: false
+    // Rows are folded in here and published to mapData once, at the end.
+    // Reassigning mapData per row repaints all 451 cells, 31 times, while
+    // the next packet is already on its way - and the controller is now
+    // proven to send all 31 (the simulator counts them), so what is lost is
+    // lost on this side.
+    property var mapScratch: []
+    property int mapRowsSeen: 0
+    property bool clearArmed: false
     property int mapRetries: 0
+    readonly property int mapMaxRetries: 5
     property real benchValue: 0
     onThrSourceChanged: benchValue = 0
 
@@ -401,7 +412,10 @@ Item {
     function pumpTx() {
         if (pendingPacket !== null || txQueue.length === 0) return
         pendingPacket = txQueue.shift()
-        if (pendingPacket[0] === cmdReqMap) { rowSeen = []; mapReceived = false }
+        if (pendingPacket[0] === cmdReqMap) {
+            rowSeen = []; mapRowsSeen = 0; mapReceived = false
+            mapScratch = mapData.slice()
+        }
         // A read-back is 31 packets and ~150 ms of pacing; if it goes
         // unanswered it was dropped, not slow. Waiting 20 s to find that
         // out is what made the first load feel like it hung - only the
@@ -472,12 +486,6 @@ Item {
             statusText = "Connected"
 
             if (scriptBooting) { lastCmdStatus = "Package starting"; return }
-            // Progress is sampled here at 20 Hz, so it can only ever be a
-            // few points along a read that lasts ~250 ms. It must therefore
-            // be replaced when the read ends, or it freezes at whatever
-            // count the last sample happened to catch and reads as a stall.
-            if (!mapReceived && pendingPacket !== null && pendingPacket[0] === cmdReqMap)
-                lastCmdStatus = "Reading map…"
             if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0
                     && Date.now() - lastAutoReq > 2000) {
                 lastAutoReq = Date.now()
@@ -493,11 +501,15 @@ Item {
             if (row >= mapThrN) return
             // A 31-bit mask would overflow a JS bitwise int, so count the
             // rows in a plain array instead.
-            rowSeen[row] = true
-            var arr = mapData.slice()
+            if (!rowSeen[row]) { rowSeen[row] = true; mapRowsSeen++ }
+            // No property assignment here: this runs between packets 8 ms
+            // apart and must not repaint.
+            if (mapScratch.length !== mapCells) mapScratch = mapData.slice()
             for (var d = 0; d < mapRowCols(row); d++)
-                arr[cellIdx(row, d)] = fxDec(view.getInt16(2 + d * 2, false))
-            mapData = arr
+                mapScratch[cellIdx(row, d)] = fxDec(view.getInt16(2 + d * 2, false))
+            // Counted off the rows themselves, so it always reaches 31 on a
+            // clean read instead of freezing wherever a 20 Hz sample landed.
+            lastCmdStatus = "Reading map: " + mapRowsSeen + "/" + mapThrN + " rows"
         } else if (cmd === rxStatus) {
             // Separate from statusText on purpose: that one doubles as
             // the connection indicator and gets overwritten back to
@@ -529,22 +541,26 @@ Item {
                 for (var r = 0; r < mapThrN; r++) if (rowSeen[r]) got++
                 mapReceived = got === mapThrN
                 if (!mapReceived) {
-                    // A dropped row is a link hiccup, not a broken map. Ask
-                    // again rather than throwing the whole read-back away -
-                    // giving up left the grid drawn as zeros with no way
-                    // back except a manual Load.
+                    // A dropped row is a link hiccup, not a broken map, so
+                    // ask again rather than throwing the read-back away.
+                    // Giving up published a grid with holes in it, drawn as
+                    // zeros, which is indistinguishable from a real map.
                     pendingPacket = null
-                    if (mapRetries < 3) {
+                    if (mapRetries < mapMaxRetries) {
                         mapRetries++
-                        lastCmdStatus = "Missing " + (mapThrN - got) + " rows, retrying (" + mapRetries + "/3)"
+                        lastCmdStatus = "Missing " + (mapThrN - got) + " of " + mapThrN
+                            + " rows, retrying (" + mapRetries + "/" + mapMaxRetries + ")"
                         requestMap()
                         return
                     }
+                    // Never publish a partial map: what is on screen stays
+                    // whatever was last read whole.
                     failTransfer("Incomplete map: " + got + "/" + mapThrN + " rows")
                     return
                 }
                 mapRetries = 0
-                lastCmdStatus = "Map and settings read from the controller"
+                mapData = mapScratch
+                lastCmdStatus = "Map read: " + mapThrN + "/" + mapThrN + " rows"
             }
             if (code > 0) lastCmdStatus = ["OK", "Map and settings saved and verified", "Map loaded", "Reset to defaults"][code]
             pendingPacket = null
@@ -2607,6 +2623,28 @@ Item {
                         Button { text: "Load from VESC"; onClicked: { sendLoad(); requestMap(); requestCfg() } }
                         Button { text: "Refresh from VESC"; onClicked: { requestMap(); requestCfg() } }
                         Button { text: "Reset to defaults"; onClicked: { sendReset(); requestMap(); requestCfg() } }
+                        // Two steps on purpose: this erases the stored
+                        // image, and an accidental click would cost the
+                        // user every cell they have tuned.
+                        Button {
+                            text: clearArmed ? "CONFIRM ERASE" : "Clear EEPROM"
+                            Material.background: clearArmed ? "#b23b3b" : undefined
+                            onClicked: {
+                                if (clearArmed) {
+                                    clearArmed = false
+                                    sendClear(); requestCfg(); requestMap()
+                                } else {
+                                    clearArmed = true
+                                    clearDisarm.restart()
+                                }
+                            }
+                        }
+                    }
+                    Timer { id: clearDisarm; interval: 5000; onTriggered: clearArmed = false }
+                    Label {
+                        visible: clearArmed
+                        text: "This erases the saved map and settings from the controller and returns it to defaults. Click again to confirm."
+                        color: "#ff9955"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
                     // lastCmdStatus gets set on every STATUS reply (see
                     // handleRx) but had nowhere to show up before. Save
