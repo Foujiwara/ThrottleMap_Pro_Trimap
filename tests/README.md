@@ -1,6 +1,6 @@
 # Regression tests
 
-> **Beta note.** This suite still encodes the stable package's 21x21
+> **Note.** This suite still encodes the CarMap 21x21
 > geometry (441 cells, 44-byte row packets, the 20260913 EEPROM header)
 > and has **not** been updated for the 31x11 map, the packed header or
 > the brake type. It was not run for this build - neither Node.js nor a

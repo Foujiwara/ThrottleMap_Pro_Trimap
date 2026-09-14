@@ -318,7 +318,7 @@
 @const-end
 
 (if (not (storage-load)) (storage-reset))
-(event-register-handler (spawn "carmap-rx" 256 event-handler))
+(event-register-handler (spawn "tmpro-rx" 256 event-handler))
 (event-enable 'event-data-rx)
-(spawn "carmap-ctl" 150 control-loop)
-(spawn "carmap-tel" 80 telemetry-loop)
+(spawn "tmpro-ctl" 150 control-loop)
+(spawn "tmpro-tel" 80 telemetry-loop)

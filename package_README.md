@@ -1,9 +1,11 @@
-# CarMap Beta (Brake Map)
+# RFP-Performance — ThrottleMap Pro Trimap
 
-**Beta fork of CarMap Thermal Throttle.** A configurable 451-cell
-throttle/duty map drives relative propulsion current and relative brake
-current. Native VESC current, voltage, temperature and speed limits
-remain active.
+A configurable 451-cell throttle/duty map drives relative propulsion
+current and relative brake current. Native VESC current, voltage,
+temperature and speed limits remain active.
+
+*Trimap*: one grid, three independently tunable regions - **traction**,
+**braking against speed**, and **reverse**.
 
 The grid is **ragged**, on purpose:
 
@@ -37,14 +39,14 @@ released throttle can never reverse the vehicle. Only a bidirectional
 brake ever reads the reverse columns.
 
 An existing 21x21 EEPROM image is converted on read (old rows become the
-traction half, every other duty column kept). Earlier beta formats are
+traction half, every other duty column kept). Earlier development formats are
 rejected and fall back to defaults.
 
 ## Setup
 
 1. Keep the ADC/PPM input app enabled and set its **Control Type** to **Off**,
    so it decodes the input without also commanding the motor.
-2. Open **CarMap**, select and calibrate the input, then apply throttle settings.
+2. Open **ThrottleMap Pro**, select and calibrate the input, then apply throttle settings.
 3. Select a preset or adjust the generator and press **Apply parameters**.
 4. Use **Save to VESC** while stopped. This uploads the displayed map and
    parameters, writes EEPROM and verifies the result. Wait for “saved and

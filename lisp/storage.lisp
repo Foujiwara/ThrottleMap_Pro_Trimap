@@ -4,7 +4,7 @@
 ; and slot 127 holds CRC16 of slots 0..126. That is the whole store: there
 ; is no spare slot left for another field.
 ; Images written by the 21x21 packages are migrated on read, never written.
-; Earlier beta formats are rejected outright - their geometry differs, and
+; Earlier development formats are rejected outright - geometry differs, and
 ; a wrong reading would be worse than falling back to defaults.
 (define storage-busy nil)
 

@@ -1,6 +1,6 @@
 # Architecture
 
-CarMap runs three LispBM processes: the input/control loop (nominal 200 Hz,
+ThrottleMap Pro runs three LispBM processes: the input/control loop (nominal 200 Hz,
 150-word stack), telemetry (20 Hz, 80 words), and the serial command handler
 (256 words). Actual frequency depends on the firmware scheduler and GC.
 
@@ -50,7 +50,7 @@ bypass this queue so STOP remains responsive; their acknowledgements cannot
 complete another command. Full-map reads verify all 31 rows arrived (counted
 in an array, not a bit mask - 31 bits would overflow a JS bitwise integer).
 
-## Brake half and brake type (beta)
+## Brake half and brake type
 
 The map's vertical axis is signed. The brake half is only read when the
 brake map is enabled and the brake lever is above its deadband, so the

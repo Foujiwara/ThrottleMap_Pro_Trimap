@@ -1,6 +1,6 @@
-// Copyright 2026 CarMap Thermal Throttle contributors
+// Copyright 2026 ThrottleMap Pro Trimap contributors
 //
-// This file is part of the CarMap Thermal Throttle VESC package.
+// This file is part of the ThrottleMap Pro Trimap VESC package.
 // Licensed under the GNU General Public License v3 or later.
 //
 // {{PACKAGE_NAME}} v{{VERSION}}
@@ -29,14 +29,14 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 14
+    property int buildMarker: 1
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
     // enough for desktop overflows on a phone. Qt.platform.os is a
     // standard Qt/QML global, independent of anything VESC Tool-specific.
     readonly property bool isMobilePlatform: Qt.platform.os === "android" || Qt.platform.os === "ios"
-    property string tabTitle: "CarMap Beta"
+    property string tabTitle: "ThrottleMap Pro"
     property bool isHorizontal: width > height
     property Commands vescCommands: VescIf.commands()
 
@@ -716,7 +716,7 @@ Item {
                 // matter what gets fixed further down. Every label here
                 // now either elides or is deliberately kept very short.
                 Label {
-                    text: "CarMap Thermal Throttle"
+                    text: "ThrottleMap Pro Trimap"
                     font.pixelSize: 30; font.bold: true; color: "#e8e8e8"
                     Layout.fillWidth: true
                     elide: Text.ElideRight
