@@ -54,34 +54,45 @@
 ; one - enter below 50 ERPM, leave only above 300 - and nothing in between
 ; can change the state.
 (define rev-blocked nil)
+; get-rpm allocates, so the guard reads it once a tick and both the latch
+; and the braking test work off this.
+(define rev-rpm 0)
 ; One buffer per owner: telemetry never shares its buffer with the event task.
 (define row-packet (array-create 44))
 (define cfg-packet (array-create 52))
 
 @const-start
 (defun rev-guard-update ()
-    (let ((r (to-i (get-rpm))))
-        (progn
-            (if (> r 300) (setq rev-blocked nil))
-            (if (< r 50) (setq rev-blocked t)))))
+    (progn
+        (setq rev-rpm (to-i (get-rpm)))
+        (if (> rev-rpm 300) (setq rev-blocked nil))
+        (if (< rev-rpm 50) (setq rev-blocked t))))
 
-; How a negative output is commanded is the brake type's job alone, and it
-; applies in every input mode - engine braking on a released throttle
-; included, which is the whole point of offering the choice in Normal mode
-; where there is no brake channel at all.
-;   0 regen only   - set-brake-rel, which can only ever slow the motor
-;   1 no reverse   - negative current down to a stop, then zero
-;   2 bidirectional- signed current throughout, on into reverse
+; Braking is torque against the way the vehicle is ACTUALLY moving. Anything
+; else is propulsion - forwards or backwards - and propulsion always leaves
+; as current, whatever the brake type says. Pressing the brake channel at a
+; standstill is a reverse request, not a braking one, so it drives out as
+; negative current even in regen-only; it is only once that reverse is
+; rolling and the map asks to stop it that the brake type gets a say.
+;
+; The brake type therefore decides one thing: how a braking request is
+; delivered.
+;   0 regen only    - set-brake-rel, which opposes rotation by construction
+;   1 current       - torque against the motion, and no reverse from a stop
+;   2 bidirectional - torque against the motion, reverse allowed
 (defun apply-output (v)
-    (if (>= v 0)
-        (set-current-rel (fp-to-f v))
-        (if (= cfg-brake-type 0)
-            (set-brake-rel (fp-to-f (- v)))
-            (progn
-                (rev-guard-update)
-                (if (and (= cfg-brake-type 1) rev-blocked)
-                    (set-current-rel 0.0)
-                    (set-current-rel (fp-to-f v)))))))
+    (progn
+        (rev-guard-update)
+        (if (or (and (> rev-rpm 50) (< v 0))
+                (and (< rev-rpm -50) (> v 0)))
+            (if (= cfg-brake-type 0)
+                (set-brake-rel (fp-to-f (abs v)))
+                (set-current-rel (fp-to-f v)))
+            ; Propulsion. "No reverse" is the one type that refuses to start
+            ; the vehicle backwards, so it holds zero instead.
+            (if (and (< v 0) (= cfg-brake-type 1) rev-blocked)
+                (set-current-rel 0.0)
+                (set-current-rel (fp-to-f v))))))
 
 ; Filtered duty. Same split-product EMA as the throttle: the accumulator
 ; carries an extra x1000 so it can actually reach its target instead of
@@ -114,12 +125,10 @@
                                 (if (= cfg-brake-map 0)
                                     (- live-brake)
                                     ; Positive cells in the brake rows are
-                                    ; forward torque, which holds a runaway
-                                    ; reverse. Only a bidirectional brake can
-                                    ; get there, so the other types never see
-                                    ; anything but braking.
-                                    (let ((v (map-lookup (- live-brake) live-duty)))
-                                        (if (= cfg-brake-type 2) v (min-f v 0))))
+                                    ; forward torque holding a runaway
+                                    ; reverse; apply-output sorts out which
+                                    ; of those is braking and which is drive.
+                                    (map-lookup (- live-brake) live-duty))
                                 (map-lookup live-throttle live-duty))))
                     ; Straight through, on purpose: the map is the torque
                     ; request, and smoothing it would blunt the very thing
