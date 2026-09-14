@@ -1,8 +1,6 @@
 ; Input values and filters use inline 28-bit fixed-point integers.
 (define thr-cfg-source 0)
 (define thr-cfg-invert 0)
-(define thr-cfg-min 20)
-(define thr-cfg-max 980)
 (define thr-cfg-deadband 20)
 (define thr-cfg-filter 1000)
 (define thr-cfg-brake-mode 0)
@@ -116,9 +114,9 @@
     (if (<= v thr-cfg-deadband) 0
         (/ (* (- v thr-cfg-deadband) 1000) (- 1000 thr-cfg-deadband))))
 
+; PPM and UART only; ADC defers to VESC Tool's own Start/End calibration.
 (defun thr-normalize (raw)
-    (let ((v (clamp-f (/ (* (- raw thr-cfg-min) 1000)
-                            (max-f 1 (- thr-cfg-max thr-cfg-min))) 0 1000)))
+    (let ((v (clamp-f (/ (* (- raw 20) 1000) 960) 0 1000)))
         ; Inversion must precede deadband, or inverted rest commands torque.
         (thr-deadband (if (= thr-cfg-invert 1) (- 1000 v) v))))
 
