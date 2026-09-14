@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 21
+    property int buildMarker: 22
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -382,6 +382,11 @@ Item {
     // second, which saturates the link and takes the interface down with
     // it - the failure looks like a frozen UI rather than a failed read.
     property double lastAutoReq: 0
+    // Each fresh connection pulls the map out of EEPROM before reading it
+    // back, so what is drawn is what is actually stored rather than
+    // whatever happens to be in the controller's RAM.
+    property bool autoLoadDone: false
+    property bool autoLoadPending: false
     property real benchValue: 0
     onThrSourceChanged: benchValue = 0
 
@@ -419,6 +424,7 @@ Item {
                 statusText = "Not connected"; benchValue = 0
                 if (pendingPacket !== null && !VescIf.isPortConnected()) failTransfer("Disconnected during transfer")
                 mapReceived = false; cfgReceived = false
+                autoLoadDone = false; autoLoadPending = false
             }
         }
     }
@@ -472,6 +478,10 @@ Item {
             if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0
                     && Date.now() - lastAutoReq > 2000) {
                 lastAutoReq = Date.now()
+                // Load first: it replaces the controller's live map and
+                // settings with the stored ones, so the read-back that
+                // follows draws the EEPROM.
+                if (!autoLoadDone) { autoLoadPending = true; sendLoad() }
                 requestCfg(); requestMap()
             }
         } else if (cmd === rxMapRow) {
@@ -497,6 +507,16 @@ Item {
             if (ack === cmdSetTestThr) return
             if (pendingPacket === null || ack !== pendingPacket[0]) return
             commandTimeout.stop()
+            if (ack === cmdLoad && autoLoadPending) {
+                autoLoadPending = false
+                autoLoadDone = true
+                lastCmdStatus = code >= 4
+                    ? "Nothing saved yet - showing the controller's current map"
+                    : "Loaded the saved map from EEPROM"
+                pendingPacket = null
+                pumpTx()
+                return
+            }
             if (code >= 4) {
                 failTransfer(({4:"Save failed: EEPROM readback differs", 5:"No valid saved data", 6:"Invalid command or settings", 7:"Controller command failed"})[code] || "Controller error")
                 return
