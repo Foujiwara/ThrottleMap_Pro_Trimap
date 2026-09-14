@@ -23,11 +23,15 @@ cp package_README.md package_README-gen.md
     echo "- Version: $VERSION"
     echo "- Build Date: $(date --rfc-3339=seconds 2>/dev/null || date)"
     echo "- Git Commit: #$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo ""
+    echo "---"
+    echo ""
+    echo "*Conçu par RFP-Performance.*"
 } >> package_README-gen.md
 
 sed -e "s/{{PACKAGE_NAME}}/$PACKAGE_NAME/g" -e "s/{{VERSION}}/$VERSION/g" ui.qml.in > ui.qml
 
 "$VESC_TOOL" --buildPkgFromDesc pkgdesc.qml
 
-echo "Built carmap_beta.vescpkg (version $VERSION)"
+echo "Built throttlemap_pro_trimap.vescpkg (version $VERSION)"
 grep -o 'buildMarker: [0-9]*' ui.qml

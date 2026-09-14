@@ -1,4 +1,4 @@
-# CarMap Thermal Throttle - VESC Package build
+# ThrottleMap Pro Trimap - VESC Package build
 #
 # This mirrors the build convention used by the official packages in
 # https://github.com/vedderb/vesc_pkg (see e.g. refloat/Makefile): the
@@ -6,7 +6,7 @@
 # packaging mode, not by any tool in this repo.
 #
 # Usage:
-#   make                              # build carmap_beta.vescpkg
+#   make                              # build throttlemap_pro_trimap.vescpkg
 #   make VESC_TOOL=/path/to/vesc_tool # point at a specific VESC Tool binary
 #   make clean
 #
@@ -21,7 +21,7 @@ VESC_TOOL ?= vesc_tool
 # to avoid depending on a third-party script that isn't vendored here.
 MINIFY_QML ?= 0
 
-PACKAGE_OUT = carmap_beta.vescpkg
+PACKAGE_OUT = throttlemap_pro_trimap.vescpkg
 
 all: $(PACKAGE_OUT)
 
@@ -44,6 +44,10 @@ package_README-gen.md: package_README.md version
 	echo "- Version: $(VERSION)" >> $@
 	echo "- Build Date: $$(date --rfc-3339=seconds 2>/dev/null || date)" >> $@
 	echo "- Git Commit: #$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" >> $@
+	echo "" >> $@
+	echo "---" >> $@
+	echo "" >> $@
+	echo "*Conçu par RFP-Performance.*" >> $@
 
 ui.qml: ui.qml.in package_name version
 	cat $< | \

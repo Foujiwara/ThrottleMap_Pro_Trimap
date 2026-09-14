@@ -167,7 +167,7 @@ unchanged, the duty axis keeps every other column (old index `2*d`, which
 lands exactly on the new 10% grid), and the brake half is generated.
 Brake map off, brake type regen-only.
 
-Earlier **beta** markers are rejected outright rather than migrated: their
+Earlier development markers are rejected outright rather than migrated: their
 geometry differs, and a wrong reading would be worse than falling back to
 defaults.
 
