@@ -46,7 +46,8 @@
 (define duty-filt-acc 0)
 ; Master switch. Disabled means this package issues no motor command at all,
 ; so the controller's own timeout releases the motor and another app can be
-; tried without uninstalling anything.
+; tried without uninstalling anything. It lives in RAM only and every boot
+; starts enabled - see storage.lisp for why it is not persisted.
 (define pkg-enabled 1)
 ; Position Lock. Position is read from the tachometer, never integrated from
 ; rpm. The tachometer counts hall edges - six per electrical revolution - so
