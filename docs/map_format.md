@@ -18,9 +18,14 @@ never constant flash.
 
 Row 10 is both zero throttle and zero lever, and stores the full 21
 columns. Its right half is engine braking against forward speed; its left
-half is engine braking while rolling backwards, editable independently -
-but only ever read through the brake lookup, so with the brake map off it
-is inert and the UI shows it as a mirror like any other throttle row.
+half belongs to the reverse block and is read by **both** lookups - a
+light pull on the lever fades in from it, and a released throttle while
+rolling backwards reads it directly. With the brake map off it is inert
+and the UI shows it as a mirror like any other throttle row.
+
+Those cells are positive by default: forward torque against a backwards
+roll, which holds the vehicle on a slope instead of letting it run away.
+Set the reverse runaway hold to 0 to freewheel there instead.
 Being a real row rather than an implicit zero also means a light pull on
 the lever fades in from whatever engine braking is doing, not from
 nothing.
@@ -34,8 +39,10 @@ editing either side edits the same cell.
 Two lookups, each bilinear on its own uniform grid; nothing ever blends
 across the seam, since throttle and brake are separate inputs.
 
-- **throttle >= 0**: rows 10..30 against `|duty|`, so rolling backwards
-  reads the same curve as rolling forwards at that speed. Engine braking
+- **throttle >= 0**: rows 11..30 against `|duty|`, so rolling backwards
+  reads the same curve as rolling forwards at that speed. Row 10 is the
+  exception: with the brake map on, negative duty reads its own left-half
+  cells (column `10 - d`) rather than the mirror. Engine braking
   and the balance point therefore work in both directions, and nothing is
   discontinuous through zero. Row 10 stores 21 columns, so its forward
   duty sits at `10 + d` - `map-drive-get` handles that.
@@ -68,9 +75,10 @@ another:
 
 3. **Reverse** - brake rows *and the released row*, duty <= 0, since that
    whole region belongs to this editor. The traction law **negated**, with
-   its own eight settings, over reverse duty. Row 10 is its seam: the lever
-   is zero there, so no reverse setting applies and it holds engine braking
-   against the backwards roll instead. `gen-rev-half` literally
+   its own eight settings, over reverse duty. Row 10 is its zero-lever
+   edge: peak and balance are both zero there, so every column falls in the
+   runaway branch, `+rev_overrun * rev^(1 + rev_curve)`, continuous with
+   the -10% row above it. `gen-rev-half` literally
    calls `thermal-cell` and negates the result, so the two regions cannot
    drift apart:
 

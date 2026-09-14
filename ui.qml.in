@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 13
+    property int buildMarker: 14
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -581,13 +581,13 @@ Item {
                 arr[cellIdx(bi, di)] = quantizeCell(val)
             }
         }
-        // Row 10 is the seam of this region: the lever is zero there, so no
-        // reverse setting applies - what is left is engine braking against
-        // the backwards roll.
+        // Row 10 is this region's zero-lever edge: peak and balance are
+        // both zero there, so the reverse law puts every column in its
+        // runaway branch, continuous with the -10% row above it.
         for (var mi = 0; mi < 10; mi++) {
-            var mduty = (10 - mi) / 10.0
+            var mrev = (10 - mi) / 10.0
             arr[cellIdx(mapThrZero, mi)] =
-                quantizeCell(-cfgEngineBrake * Math.pow(mduty, 1 + cfgRegenCurve))
+                quantizeCell(cfgRevOverrun * Math.pow(mrev, 1 + cfgRevCurve))
         }
         mapData = arr
     }

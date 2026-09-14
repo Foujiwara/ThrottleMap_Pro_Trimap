@@ -35,9 +35,15 @@
 ; Zero lever is row 10, the released row, so a light pull fades in from
 ; whatever engine braking is doing rather than from nothing.
 (defun map-brake-get (p d-i) (map-get-cell (- 10 p) d-i))
-; Row 10 stores the full 21 columns, so forward duty sits at 10 + d there.
-(defun map-drive-get (t-i d-i)
-    (map-get-cell t-i (if (= t-i 10) (+ d-i 10) d-i)))
+; Row 10 stores the full 21 columns, so forward duty sits at 10 + d there
+; and reverse at 10 - d. Its reverse half is only live with the brake map
+; on; otherwise it mirrors like every other throttle row, which is exactly
+; what the UI draws.
+(defun map-drive-get (t-i d-i neg)
+    (map-get-cell t-i
+        (if (= t-i 10)
+            (if (and neg (= cfg-brake-map 1)) (- 10 d-i) (+ d-i 10))
+            d-i)))
 
 ; ---- lookup --------------------------------------------------------------
 ; Both halves interpolate on their own uniform grid; nothing ever needs to
@@ -61,12 +67,13 @@
 ; both directions, with no discontinuity through zero.
 (defun map-lookup-drive (thr duty)
     (let ((tf (* (clamp-f thr 0 1000) 20))
+          (neg (< duty 0))
           (df (* (clamp-f (abs duty) 0 1000) 10))
           (t0 (min-f (+ 10 (/ tf 1000)) 30)) (d0 (min-f (/ df 1000) 10))
           (t1 (min-f (+ t0 1) 30)) (d1 (min-f (+ d0 1) 10))
           (tw (mod tf 1000)) (dw (mod df 1000))
-          (v00 (map-drive-get t0 d0)) (v01 (map-drive-get t0 d1))
-          (v10 (map-drive-get t1 d0)) (v11 (map-drive-get t1 d1))
+          (v00 (map-drive-get t0 d0 neg)) (v01 (map-drive-get t0 d1 neg))
+          (v10 (map-drive-get t1 d0 neg)) (v11 (map-drive-get t1 d1 neg))
           (v0 (+ v00 (/ (* (- v01 v00) dw) 1000)))
           (v1 (+ v10 (/ (* (- v11 v10) dw) 1000))))
         (+ v0 (/ (* (- v1 v0) tw) 1000))))
@@ -147,13 +154,15 @@
 (defun gen-rev-half ()
     (progn
         (gen-rev-rows)
-        ; Row 10 is the seam of this region: the lever is zero there, so no
-        ; reverse setting applies. What is left is engine braking against
-        ; the backwards roll - negative, so it brakes rather than driving.
+        ; Row 10 is this region's zero-lever edge. The reverse law there has
+        ; peak and balance at zero, so every column falls in its runaway
+        ; branch: +overrun * rev^(1+curve), continuous with the -10% row
+        ; above it. thermal-cell cannot be reused - its released-throttle
+        ; branch would short-circuit to zero.
         (looprange di 0 10
             (map-set-cell 10 di
-                (to-fp (- (* cfg-engine-brake
-                             (pow (/ (- 10 di) 10.0)
-                                  (+ 1.0 cfg-regen-curve)))))))))
+                (to-fp (* cfg-rev-overrun
+                          (pow (/ (- 10 di) 10.0)
+                               (+ 1.0 cfg-rev-curve))))))))
 
 @const-end
