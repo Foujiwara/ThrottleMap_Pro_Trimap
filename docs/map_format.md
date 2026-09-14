@@ -18,7 +18,9 @@ never constant flash.
 
 Row 10 is both zero throttle and zero lever, and stores the full 21
 columns. Its right half is engine braking against forward speed; its left
-half is engine braking while rolling backwards, editable independently.
+half is engine braking while rolling backwards, editable independently -
+but only ever read through the brake lookup, so with the brake map off it
+is inert and the UI shows it as a mirror like any other throttle row.
 Being a real row rather than an implicit zero also means a light pull on
 the lever fades in from whatever engine braking is doing, not from
 nothing.
