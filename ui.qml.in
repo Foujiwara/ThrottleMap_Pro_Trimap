@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 12
+    property int buildMarker: 13
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -785,6 +785,26 @@ Item {
                 Rectangle {
                     width: 10; height: 10; radius: 5
                     color: statusText === "Connected" ? "#33cc66" : "#888888"
+                }
+            }
+
+            // A package that commands nothing looks exactly like a package
+            // that is broken. Say which, loudly.
+            Rectangle {
+                visible: pkgEnabled === 0
+                Layout.fillWidth: true
+                implicitHeight: offLabel.implicitHeight + 10
+                color: "#5a1a1a"; border.color: "#ff5555"; border.width: 1
+                radius: 3
+                Label {
+                    id: offLabel
+                    anchors.fill: parent
+                    anchors.margins: 5
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    wrapMode: Text.WordWrap
+                    text: "DISABLED - no motor command is being sent. Config tab, Master switch."
+                    color: "#ffbbbb"; font.bold: true; font.pixelSize: 14
                 }
             }
 

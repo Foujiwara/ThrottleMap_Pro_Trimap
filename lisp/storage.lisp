@@ -37,7 +37,11 @@
         (bufset-u8 b 7 cfg-preset)
         ; Retired throttle Min/Max slots, now the control-loop settings.
         (bufset-i16 b 8 cfg-duty-filter)
-        (bufset-u8 b 10 pkg-enabled) ; byte 11 stays reserved
+        ; Bytes 10-11 reserved. The master switch is deliberately NOT
+        ; stored: a package that can save itself disabled comes back
+        ; disabled after every power cycle, with no motor command at all
+        ; and nothing but a small badge to say why.
+        (bufset-i16 b 10 0)
         (bufset-i16 b 12 thr-cfg-deadband)
         (bufset-i16 b 14 thr-cfg-filter)
         (bufset-i16 b 16 (to-fp cfg-torque-resp))
@@ -132,7 +136,6 @@
         (in-range (bufget-u8 b 6) 0 2)
         (in-range (bufget-u8 b 7) 0 4)
         (in-range (bufget-i16 b 8) 1 1000)
-        (in-range (bufget-u8 b 10) 0 1)
         (in-range (bufget-i16 b 12) 0 999)
         (in-range (bufget-i16 b 14) 1 1000)
         (in-range (bufget-i16 b 16) 300 2000)
@@ -185,7 +188,6 @@
         (setq thr-cfg-brake-mode (bufget-u8 b 6))
         (setq cfg-preset (bufget-u8 b 7))
         (setq cfg-duty-filter (bufget-i16 b 8))
-        (setq pkg-enabled (bufget-u8 b 10))
         (setq thr-cfg-deadband (bufget-i16 b 12))
         (setq thr-cfg-filter (bufget-i16 b 14))
         (setq cfg-torque-resp (fp-to-f (bufget-i16 b 16)))
