@@ -44,6 +44,11 @@
 ; least as much as the throttle does. 1000 = unfiltered.
 (define cfg-duty-filter 300)
 (define duty-filt-acc 0)
+; True until the stored image is loaded, or the defaults generated in its
+; place. Separate from storage-busy on purpose: storage-busy is cleared by
+; whichever packet set it, and a read-back arriving mid-boot would clear
+; this one out from under the generator.
+(define boot-busy t)
 ; Master switch. Disabled means this package issues no motor command at all,
 ; so the controller's own timeout releases the motor and another app can be
 ; tried without uninstalling anything. It lives in RAM only and every boot
@@ -208,7 +213,7 @@
                         (set-current-rel (fp-to-f live-cur-rel))))))))))
 
 (defun control-tick ()
-    (if (or storage-busy (= pkg-enabled 0))
+    (if (or boot-busy storage-busy (= pkg-enabled 0))
         ; Command nothing at all: the firmware timeout releases the motor.
         ; Nothing to clear here - the enable handler resets the lock and the
         ; duty filter on the way in.
@@ -259,8 +264,11 @@
                 ; ADC1 voltage in millivolts for bidirectional calibration.
                 (bufset-i16 b 15 (clamp-f (to-i (* (get-adc 0) 1000.0)) 0 3300))
                 (bufset-u8 b 17 pkg-enabled)
-                ; state in the low nibble, last release reason above it
-                (bufset-u8 b 18 (+ (if lock-on 1 0) (* 16 lock-reason)))
+                ; state in the low nibble, release reason in the next
+                ; three bits, and the top bit says the script is still
+                ; building its configuration and cannot answer yet.
+                (bufset-u8 b 18 (+ (if lock-on 1 0) (* 16 lock-reason)
+                                   (if boot-busy 128 0)))
                 (bufset-i16 b 19 (if lock-on (clamp-f (lock-error) -32000 32000) 0))
                 (bufset-i16 b 21 (clamp-f (to-i (get-rpm)) -32000 32000))
                 (proto-send b)
@@ -467,6 +475,10 @@
             ((= cmd pkt-req-cfg) (send-cfg-echo)))))
 
 (defun handle-packet (data)
+    (if boot-busy
+        ; Answer rather than drop it: an unanswered read-back costs the
+        ; interface a full timeout before it tries again.
+        (proto-send-status 7 (if (> (buflen data) 0) (bufget-u8 data 0) 0))
     (if (packet-valid data)
         (let ((cmd (bufget-u8 data 0)))
             ; Pause only operations that replace configuration or a full map.
@@ -479,7 +491,7 @@
                         (if (and (>= cmd pkt-cmd-save) (<= cmd pkt-cmd-reset)) (- cmd 4) 0)
                         (if (= cmd pkt-cmd-save) 4 (if (= cmd pkt-cmd-load) 5 7)))
                     cmd)))))
-        (proto-send-status 6 (if (> (buflen data) 0) (bufget-u8 data 0) 0))))
+        (proto-send-status 6 (if (> (buflen data) 0) (bufget-u8 data 0) 0)))))
 
 (defun event-handler ()
     (loopwhile t
@@ -488,8 +500,15 @@
             (_ nil))))
 @const-end
 
-(if (not (storage-load)) (storage-reset))
+; Threads first, configuration second. Generating the default map is
+; hundreds of interpreted float operations across 451 cells; run before the
+; threads exist, the interface gets no telemetry and no answer to anything
+; for the whole of it, which reads as a package that failed to start rather
+; than one that is busy. boot-busy keeps the motor silent and the protocol
+; honest until it is done.
 (event-register-handler (spawn "tmpro-rx" 256 event-handler))
 (event-enable 'event-data-rx)
 (spawn "tmpro-ctl" 150 control-loop)
 (spawn "tmpro-tel" 80 telemetry-loop)
+(if (not (storage-load)) (storage-reset))
+(setq boot-busy nil)

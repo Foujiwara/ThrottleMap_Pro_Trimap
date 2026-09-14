@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 14
+    property int buildMarker: 16
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -156,6 +156,7 @@ Item {
     // Lock settings live in RAM on the controller: the EEPROM is full, and
     // the lock can only be engaged from here anyway.
     property int lockReason: 0      // 1 timeout 2 throttle 3 brake 4 off 5 asked
+    property bool scriptBooting: false
     property int lockTimeout: 60    // seconds; 0 = never lets go
     property real lockTravel: 0.25  // revolutions for full hold current
     property real lockMax: 0.15     // hold current, relative
@@ -393,6 +394,12 @@ Item {
         if (pendingPacket !== null || txQueue.length === 0) return
         pendingPacket = txQueue.shift()
         if (pendingPacket[0] === cmdReqMap) { rowSeen = []; mapReceived = false }
+        // A read-back is 31 packets and ~150 ms of pacing; if it goes
+        // unanswered it was dropped, not slow. Waiting 20 s to find that
+        // out is what made the first load feel like it hung - only the
+        // EEPROM operations genuinely need that long.
+        var op = pendingPacket[0]
+        commandTimeout.interval = (op === cmdReqMap || op === cmdReqCfg) ? 3000 : 20000
         commandTimeout.restart()
         transmitPacket(pendingPacket)
     }
@@ -433,10 +440,16 @@ Item {
         if (cmd === rxLive) {
             if (view.byteLength !== 23) return
             lastLiveTime = Date.now()
+            if (!mapReceived && pendingPacket !== null && pendingPacket[0] === cmdReqMap) {
+                var seen = 0
+                for (var i = 0; i < mapThrN; i++) if (rowSeen[i]) seen++
+                lastCmdStatus = "Reading map: " + seen + "/" + mapThrN + " rows"
+            }
+            if (scriptBooting) { lastCmdStatus = "Package starting"; return }
             if ((!mapReceived || !cfgReceived) && pendingPacket === null && txQueue.length === 0
                     && Date.now() - lastAutoReq > 2000) {
                 lastAutoReq = Date.now()
-                requestMap(); requestCfg()
+                requestCfg(); requestMap()
             }
             liveThrottle = fxDec(view.getInt16(1, false))
             liveDuty = fxDec(view.getInt16(3, false))
@@ -446,8 +459,10 @@ Item {
             liveBrake = fxDec(view.getInt16(13, false))
             liveAdcVoltage = view.getInt16(15, false) / 1000.0
             pkgEnabled = view.getUint8(17)
-            lockState = view.getUint8(18) & 0x0f
-            lockReason = view.getUint8(18) >> 4
+            var lockByte = view.getUint8(18)
+            lockState = lockByte & 0x0f
+            lockReason = (lockByte >> 4) & 0x07
+            scriptBooting = (lockByte & 0x80) !== 0
             lockErr = view.getInt16(19, false) / 1000.0
             liveRpmFast = view.getInt16(21, false)
             statusText = "Connected"
