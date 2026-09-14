@@ -129,7 +129,7 @@ generator settings sit in a tail after the map.
 | --- | --- |
 | 0 | Format marker; 0 means incomplete/invalid |
 | 4..7 | Throttle source, invert, brake mode, preset id (u8 each) |
-| 8, 10 | Throttle min/max, i16 scaled by 1000 |
+| 8, 10 | Duty filter alpha (i16 x1000), output ramp in ms |
 | 12, 14 | Deadband, filter alpha |
 | 16, 18 | Torque response, speed coupling |
 | 20, 22 | Transition width, high hold |

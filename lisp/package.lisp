@@ -40,6 +40,13 @@
 (define cfg-rev-shape 1)
 (define cfg-rev-overrun 0.12)
 (define cfg-rev-curve 1)
+; Duty is the variable the map closes its loop on, so it needs filtering at
+; least as much as the throttle does. 1000 = unfiltered.
+(define cfg-duty-filter 300)
+; Milliseconds for the output to travel full scale. 0 = no limit.
+(define cfg-slew-ms 150)
+(define duty-filt-acc 0)
+(define live-cmd 0)
 (define live-throttle 0)
 (define live-duty 0)
 (define live-cur-rel 0)
@@ -61,31 +68,57 @@
             (if (> r 300) (setq rev-blocked nil))
             (if (< r 50) (setq rev-blocked t)))))
 
-; The command mode follows the ADC input mode, not the sign of the output:
-;   Normal      - no brake channel, so a negative map value is pure regen
-;                 and goes out as set-brake-rel, which cannot reverse.
-;   Double ADC  - signed current throughout, never a brake command.
-;   Bidirectional
-; In the two brake modes, "no reverse" holds zero current once the latch
-; says the vehicle has stopped, instead of driving it backwards.
+; How a negative output is commanded is the brake type's job alone, and it
+; applies in every input mode - engine braking on a released throttle
+; included, which is the whole point of offering the choice in Normal mode
+; where there is no brake channel at all.
+;   0 regen only   - set-brake-rel, which can only ever slow the motor
+;   1 no reverse   - negative current down to a stop, then zero
+;   2 bidirectional- signed current throughout, on into reverse
 (defun apply-output (v)
-    (if (= thr-cfg-brake-mode thr-brake-none)
-        (if (< v 0)
+    (if (>= v 0)
+        (set-current-rel (fp-to-f v))
+        (if (= cfg-brake-type 0)
             (set-brake-rel (fp-to-f (- v)))
-            (set-current-rel (fp-to-f v)))
-        (progn
-            (rev-guard-update)
-            (if (and (< v 0) (< cfg-brake-type 2) rev-blocked)
-                (set-current-rel 0.0)
-                (set-current-rel (fp-to-f v))))))
+            (progn
+                (rev-guard-update)
+                (if (and (= cfg-brake-type 1) rev-blocked)
+                    (set-current-rel 0.0)
+                    (set-current-rel (fp-to-f v)))))))
+
+; Filtered duty. Same split-product EMA as the throttle: the accumulator
+; carries an extra x1000 so it can actually reach its target instead of
+; stalling a rounding step short. Signed, and the truncating division and
+; mod agree on sign, so negative duty filters correctly too.
+(defun duty-read ()
+    (let ((d (to-fp (get-duty))))
+        (if (>= cfg-duty-filter 1000)
+            d
+            (progn
+                (setq duty-filt-acc
+                    (+ duty-filt-acc
+                       (* cfg-duty-filter (- d (/ duty-filt-acc 1000)))
+                       (- (/ (* cfg-duty-filter (mod duty-filt-acc 1000)) 1000))))
+                (/ duty-filt-acc 1000)))))
+
+; Rate limit on the command itself. The VESC's own apps ramp their output;
+; ours bypasses that entirely because their control type is Off, so without
+; this every step in the map leaves as an instant torque step.
+(defun slew-step (cur target)
+    (if (= cfg-slew-ms 0)
+        target
+        (let ((step (max-f 1 (/ 5000 cfg-slew-ms))))
+            (if (> target (+ cur step))
+                (+ cur step)
+                (if (< target (- cur step)) (- cur step) target)))))
 
 (defun control-tick ()
     (if storage-busy
-        (setq live-cur-rel 0)
+        (progn (setq live-cur-rel 0) (setq live-cmd 0) (setq duty-filt-acc 0))
         (progn
             (setq live-throttle (thr-read))
             (setq live-brake (thr-brake-read))
-            (setq live-duty (to-fp (get-duty)))
+            (setq live-duty (duty-read))
             (let ((lever (> live-brake 0)))
                 (progn
                     (setq live-cur-rel
@@ -101,7 +134,10 @@
                                     (let ((v (map-lookup (- live-brake) live-duty)))
                                         (if (= cfg-brake-type 2) v (min-f v 0))))
                                 (map-lookup live-throttle live-duty))))
-                    (apply-output live-cur-rel))))))
+                    ; A lost input must cut instantly, never ramp down.
+                    (setq live-cmd
+                        (if thr-expired 0 (slew-step live-cmd live-cur-rel)))
+                    (apply-output live-cmd))))))
 
 (defun control-loop ()
     (loopwhile t (progn (control-tick) (sleep 0.005))))
@@ -151,8 +187,8 @@
         (bufset-u8 b 15 cfg-regen-curve)
         (bufset-u8 b 16 thr-cfg-source)
         (bufset-u8 b 17 thr-cfg-invert)
-        (bufset-i16 b 18 thr-cfg-min)
-        (bufset-i16 b 20 thr-cfg-max)
+        (bufset-i16 b 18 cfg-duty-filter)
+        (bufset-i16 b 20 cfg-slew-ms)
         (bufset-i16 b 22 thr-cfg-deadband)
         (bufset-i16 b 24 thr-cfg-filter)
         (bufset-u8 b 26 thr-cfg-brake-mode)
@@ -220,9 +256,8 @@
                     ((= cmd pkt-set-thr)
                         (and (= n 12) (<= (bufget-u8 data 1) 3)
                              (<= (bufget-u8 data 2) 1)
-                             (in-range (bufget-i16 data 3) 0 1000)
-                             (in-range (bufget-i16 data 5) 0 1000)
-                             (< (bufget-i16 data 3) (bufget-i16 data 5))
+                             (in-range (bufget-i16 data 3) 1 1000)
+                             (in-range (bufget-i16 data 5) 0 2000)
                              (in-range (bufget-i16 data 7) 0 999)
                              (in-range (bufget-i16 data 9) 1 1000)
                              (<= (bufget-u8 data 11) 2)))
@@ -275,8 +310,8 @@
                 (progn
                     (setq thr-cfg-source (bufget-u8 data 1))
                     (setq thr-cfg-invert (bufget-u8 data 2))
-                    (setq thr-cfg-min (bufget-i16 data 3))
-                    (setq thr-cfg-max (bufget-i16 data 5))
+                    (setq cfg-duty-filter (bufget-i16 data 3))
+                    (setq cfg-slew-ms (bufget-i16 data 5))
                     (setq thr-cfg-deadband (bufget-i16 data 7))
                     (setq thr-cfg-filter (bufget-i16 data 9))
                     (setq thr-cfg-brake-mode (bufget-u8 data 11))

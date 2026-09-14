@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 4
+    property int buildMarker: 5
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -182,6 +182,9 @@ Item {
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
     property int thrInvert: 0
     property real thrDeadband: 0.02
+    // Control-loop damping, in the retired throttle Min/Max wire slots
+    property real cfgDutyFilter: 0.30
+    property int cfgSlewMs: 150
     property real thrFilter: 1.0
     property int thrBrakeMode: 0 // independent ADC2 brake channel
 
@@ -199,6 +202,8 @@ Item {
             range(c.engineBrake,0,0.6,false); range(c.overrunRegen,0,0.5,false); range(c.regenCurve,0,3,true)
             range(c.thrSource,0,3,true); range(c.thrInvert,0,1,true)
             range(c.thrDeadband,0,0.999,false); range(c.thrFilter,0.001,1,false)
+            if (c.dutyFilter !== undefined) range(c.dutyFilter,0.001,1,false)
+            if (c.slewMs !== undefined) range(c.slewMs,0,2000,true)
             if (c.thrBrakeMode !== undefined) range(c.thrBrakeMode,0,2,true)
             if (c.brakeMap !== undefined) range(c.brakeMap,0,1,true)
             if (c.brakeType !== undefined) range(c.brakeType,0,2,true)
@@ -315,9 +320,8 @@ Item {
     function sendSetThrottle() {
         benchValue = 0
         var b = [cmdSetThr, thrSource & 0xff, thrInvert & 0xff]
-        // Retained wire fields are inert for ADC: VESC Tool owns Start/End.
-        b = b.concat(i16Bytes(20))
-        b = b.concat(i16Bytes(980))
+        b = b.concat(i16Bytes(fxEnc(cfgDutyFilter)))
+        b = b.concat(i16Bytes(cfgSlewMs))
         b = b.concat(i16Bytes(fxEnc(thrDeadband)))
         b = b.concat(i16Bytes(fxEnc(thrFilter)))
         b.push(thrBrakeMode & 0xff)
@@ -460,6 +464,8 @@ Item {
             cfgRegenCurve = view.getUint8(15)
             thrSource = view.getUint8(16)
             thrInvert = view.getUint8(17)
+            cfgDutyFilter = fxDec(view.getInt16(18, false))
+            cfgSlewMs = view.getInt16(20, false)
             thrDeadband = fxDec(view.getInt16(22, false))
             thrFilter = fxDec(view.getInt16(24, false))
             thrBrakeMode = view.getUint8(26)
@@ -2077,33 +2083,27 @@ Item {
                             : "Off: the brake lever commands a plain proportional brake, unchanged from the stable package. Turn it on to shape braking against speed too."
                         color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
-                    // Normal mode has no brake channel at all, so there is
-                    // nothing to choose: every negative map value leaves as
-                    // set-brake-rel, which cannot turn the motor backwards.
+                    // Independent of the input mode: this decides how any
+                    // negative output is commanded, engine braking on a
+                    // released throttle included.
+                    Label { text: "Brake type"; color: "#ccc" }
+                    ComboBox {
+                        Layout.fillWidth: true
+                        model: ["Regen only",
+                                "Current, no reverse",
+                                "Current, bidirectional (reverse)"]
+                        currentIndex: cfgBrakeType
+                        onActivated: (idx) => { cfgBrakeType = idx; sendSetConfig(false) }
+                    }
                     Label {
-                        visible: thrBrakeMode === 0
-                        text: "Normal mode commands relative current when the map is positive and relative brake when it is negative. The brake command can only ever slow the motor down, never drive it backwards."
+                        text: ["Regen only: every negative value leaves as a relative brake command, which can only slow the motor and never turn it backwards.",
+                               "Current, no reverse: negative current all the way down to a stop, then zero current instead of reversing. The hold releases only once you are clearly rolling forward again, so it cannot shunt back and forth around standstill.",
+                               "Current, bidirectional: signed current throughout - it decelerates, stops, and drives on into reverse."][cfgBrakeType]
                         color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
-                    ColumnLayout {
-                        visible: thrBrakeMode !== 0
-                        Layout.fillWidth: true; spacing: 2
-                        Label { text: "Brake type"; color: "#ccc" }
-                        ComboBox {
-                            Layout.fillWidth: true
-                            model: ["Current, no reverse",
-                                    "Current, bidirectional (reverse)"]
-                            // Stored as 1 and 2; 0 is the retired regen-only
-                            // entry, which is what Normal mode does anyway.
-                            currentIndex: cfgBrakeType >= 2 ? 1 : 0
-                            onActivated: (idx) => { cfgBrakeType = idx + 1; sendSetConfig(false) }
-                        }
-                        Label {
-                            text: cfgBrakeType >= 2
-                                ? "Signed current throughout, so it decelerates, stops and drives on into reverse. No brake command is ever sent in this mode."
-                                : "Negative current while travelling forward. Once the motor is stopped it holds zero current instead of reversing, and only releases that hold once you are clearly rolling forward again. No brake command is ever sent in this mode."
-                            color: "#9bd"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
-                        }
+                    Label {
+                        text: "Applies in all three input modes, including engine braking with the throttle released in Normal mode."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                     }
 
 
@@ -2181,6 +2181,66 @@ Item {
 
                     Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
 
+                    Label { text: "Control loop damping"; font.bold: true; color: "#ddd" }
+                    Label {
+                        text: "The map reads duty back and turns it into a current request, so it is a closed loop. Near a balance point its slope reaches 0.10 of current per 1% of duty, which turns duty ripple straight into torque ripple. These two settings damp that."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Duty filter"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: cfgDutyFilter.toFixed(2)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0.01, 1.0)
+                                    if (v !== null) { cfgDutyFilter = v; sendSetThrottle() }
+                                    text = Qt.binding(function() { return cfgDutyFilter.toFixed(2) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0.01; to: 1.0
+                            value: cfgDutyFilter
+                            onMoved: cfgDutyFilter = value
+                            onPressedChanged: if (!pressed) sendSetThrottle()
+                        }
+                    }
+                    Label {
+                        text: "1.00 is unfiltered, as every build before this one. Lower values smooth the duty the map reads; 0.30 is about a 14 ms time constant at the 200 Hz loop rate."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { Layout.fillWidth: true
+                            Label { text: "Output ramp (ms, full scale)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            TextField {
+                                Layout.preferredWidth: 60
+                                horizontalAlignment: TextInput.AlignRight
+                                text: cfgSlewMs.toFixed(0)
+                                onEditingFinished: {
+                                    var v = parseClamped(text, 0, 2000)
+                                    if (v !== null) { cfgSlewMs = Math.round(v); sendSetThrottle() }
+                                    text = Qt.binding(function() { return cfgSlewMs.toFixed(0) })
+                                }
+                            }
+                        }
+                        Slider {
+                            Layout.fillWidth: true; from: 0; to: 1000; stepSize: 10
+                            value: cfgSlewMs
+                            onMoved: cfgSlewMs = Math.round(value)
+                            onPressedChanged: if (!pressed) sendSetThrottle()
+                        }
+                    }
+                    Label {
+                        text: "Milliseconds for the command to travel its full range. 0 disables it. A lost input still cuts instantly - the ramp is never in the safety path."
+                        color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                    }
+
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+
                     Label { text: "Persistence"; font.bold: true; color: "#ddd" }
                     // Flow, not RowLayout: 4 buttons with fairly long
                     // labels never shrink and never wrap in a RowLayout,
@@ -2220,6 +2280,7 @@ Item {
                             engineBrake: cfgEngineBrake, overrunRegen: cfgOverrunRegen, regenCurve: cfgRegenCurve,
                             thrSource: thrSource, thrInvert: thrInvert,
                             thrDeadband: thrDeadband, thrFilter: thrFilter, thrBrakeMode: thrBrakeMode,
+                            dutyFilter: cfgDutyFilter, slewMs: cfgSlewMs,
                             brakeMap: cfgBrakeMap, brakeType: cfgBrakeType,
                             brakeStr: cfgBrakeStr, brakeResp: cfgBrakeResp,
                             brakeDep: cfgBrakeDep, brakeCurve: cfgBrakeCurve,
@@ -2242,6 +2303,8 @@ Item {
                                         cfgRegenCurve = obj.cfg.regenCurve; thrSource = obj.cfg.thrSource
                                         thrInvert = obj.cfg.thrInvert
                                         thrDeadband = obj.cfg.thrDeadband; thrFilter = obj.cfg.thrFilter
+                                        cfgDutyFilter = obj.cfg.dutyFilter === undefined ? 0.30 : obj.cfg.dutyFilter
+                                        cfgSlewMs = obj.cfg.slewMs === undefined ? 150 : obj.cfg.slewMs
                                         thrBrakeMode = obj.cfg.thrBrakeMode === undefined ? 0 : obj.cfg.thrBrakeMode
                                         cfgBrakeMap = obj.cfg.brakeMap === undefined ? 0 : obj.cfg.brakeMap
                                         cfgBrakeType = obj.cfg.brakeType === undefined ? 0 : obj.cfg.brakeType
