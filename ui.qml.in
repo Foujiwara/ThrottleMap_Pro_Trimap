@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 10
+    property int buildMarker: 11
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -80,9 +80,21 @@ Item {
     function mapRowCols(t) { return t <= mapThrZero ? 21 : 11 }
     // Every view draws 21 display columns per row, duty -100%..+100%.
     // dispCol says which stored cell one of them reads.
-    function dispCol(t, g) { return t <= mapThrZero ? g : Math.abs(g - 10) }
+    // The released row owns 21 columns, but its negative-duty half is only
+    // ever read through the brake lookup - so with the brake map off it is
+    // inert, and shows as a mirror like any other throttle row rather than
+    // as an editable cell that changes nothing.
+    function dispCol(t, g) {
+        if (t < mapThrZero) return g
+        if (t === mapThrZero) return cfgBrakeMap === 1 ? g : Math.abs(g - 10) + 10
+        return Math.abs(g - 10)
+    }
     // True where a display column is only a mirror of another cell.
-    function isMirrored(t, g) { return t > mapThrZero && g < 10 }
+    function isMirrored(t, g) {
+        if (g >= 10) return false
+        if (t > mapThrZero) return true
+        return t === mapThrZero && cfgBrakeMap !== 1
+    }
     function dispDuty(g) { return (g - 10) / 10.0 }
     // Signed duty a STORED column stands for
     function colDuty(t, d) { return t <= mapThrZero ? (d - 10) / 10.0 : d / 10.0 }
@@ -857,6 +869,7 @@ Item {
 
                         Connections { target: mainItem; function onMapDataChanged() { heatmap.requestPaint() } }
                         Connections { target: mainItem; function onSelectionChanged() { heatmap.requestPaint() } }
+                        Connections { target: mainItem; function onCfgBrakeMapChanged() { heatmap.requestPaint() } }
                         onRowBaseChanged: requestPaint()
                         onWidthChanged: requestPaint()
                         onHeightChanged: requestPaint()
@@ -922,7 +935,7 @@ Item {
                     // axis labels
                     Label { text: cfgBrakeMap === 1 ? "Brake -100%  /  Duty -100%" : "Throttle 0%  /  Duty -100%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label {
-                        text: "Dimmed = mirror of the other side, same cells. The released row (0% throttle) has its own editable reverse half."
+                        text: "Dimmed = mirror of the other side, same cells. With the brake map on, the 0% throttle row gains its own editable reverse half."
                         color: "#555"; font.pixelSize: 15
                         anchors.horizontalCenter: parent.horizontalCenter; anchors.top: parent.top; anchors.margins: 4
                     }
