@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 11
+    property int buildMarker: 12
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -574,6 +574,14 @@ Item {
                 arr[cellIdx(bi, di)] = quantizeCell(val)
             }
         }
+        // Row 10 is the seam of this region: the lever is zero there, so no
+        // reverse setting applies - what is left is engine braking against
+        // the backwards roll.
+        for (var mi = 0; mi < 10; mi++) {
+            var mduty = (10 - mi) / 10.0
+            arr[cellIdx(mapThrZero, mi)] =
+                quantizeCell(-cfgEngineBrake * Math.pow(mduty, 1 + cfgRegenCurve))
+        }
         mapData = arr
     }
 
@@ -596,13 +604,6 @@ Item {
     // slider ever rewrites them (gen-thermal-map in map.lisp matches).
     function regenerateLocalMap() {
         var arr = mapData.slice()
-        // Released row, negative duty: engine braking while rolling
-        // backwards, seeded as the mirror and editable on its own.
-        for (var mi = 0; mi < 10; mi++) {
-            var mduty = (10 - mi) / 10.0
-            arr[cellIdx(mapThrZero, mi)] =
-                quantizeCell(-cfgEngineBrake * Math.pow(mduty, 1 + cfgRegenCurve))
-        }
         for (var ti = 0; ti < 21; ti++) {
             var thr = ti / 20.0
             var peak = thermalPeak(thr, cfgTorqueResp, cfgHighHold)

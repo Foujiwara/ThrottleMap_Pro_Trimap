@@ -58,8 +58,7 @@ There are **three generators**, one per region of the graph, each with its
 own regenerate flag so shaping one never discards hand edits made to
 another:
 
-1. **Traction** - rows 10..30, the thermal law above. It also seeds row
-   10's negative-duty half with the mirrored engine-braking curve.
+1. **Traction** - rows 10..30, the thermal law above, forward duty only.
 2. **Brake** - brake rows, duty > 0. A plateau by default:
 
 ```
@@ -67,8 +66,11 @@ another:
   * ((1 - duty_dep) + duty_dep * duty^(1 + brake_curve)))
 ```
 
-3. **Reverse** - brake rows, duty <= 0. The traction law **negated**, with
-   its own eight settings, over reverse duty. `gen-rev-half` literally
+3. **Reverse** - brake rows *and the released row*, duty <= 0, since that
+   whole region belongs to this editor. The traction law **negated**, with
+   its own eight settings, over reverse duty. Row 10 is its seam: the lever
+   is zero there, so no reverse setting applies and it holds engine braking
+   against the backwards roll instead. `gen-rev-half` literally
    calls `thermal-cell` and negates the result, so the two regions cannot
    drift apart:
 
