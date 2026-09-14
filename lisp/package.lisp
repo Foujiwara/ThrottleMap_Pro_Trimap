@@ -270,9 +270,11 @@
                 (if (< d (map-row-cols row-i)) (map-get-cell row-i d) 0)))
         (proto-send row-packet)))
 
+; 31 rows back to back can outrun the link, and a single dropped row fails
+; the whole read-back. 5 ms a row costs 150 ms and is far more forgiving.
 (defun send-full-map ()
     (looprange r 0 map-thr-n
-        (progn (send-map-row r) (sleep 0.002))))
+        (progn (send-map-row r) (sleep 0.005))))
 
 (defun send-cfg-echo ()
     (let ((b cfg-packet))
