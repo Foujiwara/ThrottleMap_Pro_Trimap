@@ -27,6 +27,20 @@
 (expect (= (map-row-cols 10) 21) 'released-row-is-full-width)
 (expect (= (map-row-cols 11) 11) 'throttle-rows-are-half-width)
 
+; ---- the stored layout ---------------------------------------------------
+; Pinned deliberately. The image is NOT wiped when the package version
+; changes - settings are meant to survive an update - so the only thing
+; protecting a reader from a changed layout is the magic. Anything that
+; moves a field, resizes the map or repurposes a byte must bump
+; eeprom-magic, and updating these numbers is where that decision gets
+; made rather than forgotten.
+(expect (= eeprom-magic 20260921) 'layout-magic-pinned)
+(expect (= eeprom-map-base 36) 'layout-map-base-pinned)
+(expect (= eeprom-map-slots 113) 'layout-map-slots-pinned)
+(expect (= map-cells 451) 'layout-cell-count-pinned)
+(expect (> eeprom-magic eeprom-prev-magic) 'magic-moves-forward)
+(expect (> eeprom-prev-magic eeprom-legacy-magic) 'magic-history-ordered)
+
 ; ---- storage -------------------------------------------------------------
 (expect (not (storage-load)) 'empty-storage)
 (storage-reset)
@@ -107,6 +121,18 @@
 (bufset-u8 ee-valid 3 0)
 (expect (not (storage-load)) 'missing-slot)
 (expect (storage-save) 'restore-slot)
+
+; Clearing drops the marker, so nothing is loadable afterwards and the next
+; boot falls back to generated defaults. The body is left in place on
+; purpose - nothing reads it once the marker is gone.
+(expect (storage-save) 'save-before-clear)
+(expect (storage-load) 'loadable-before-clear)
+(expect (storage-clear) 'clear-succeeds)
+(expect (= (eeprom-read-i 0) 0) 'marker-erased)
+(expect (not (storage-load)) 'nothing-loads-after-clear)
+(expect (not storage-busy) 'clear-releases-the-pause)
+(expect (storage-save) 'save-after-clear)
+(expect (storage-load) 'loadable-again)
 
 ; ---- map lookup ----------------------------------------------------------
 (storage-reset)
@@ -336,6 +362,16 @@
 (handle-packet lockcmd)
 (expect (not lock-on) 'released-over-wire)
 (expect (= lock-reason 5) 'release-reason-asked)
+
+; Clear over the wire erases the image and returns to defaults in one step.
+(define clearpkt (array-create 1))
+(bufset-u8 clearpkt 0 0x0F)
+(expect (storage-save) 'save-before-wire-clear)
+(handle-packet clearpkt)
+(expect (= last-status 0) 'clear-accepted)
+(expect (= (eeprom-read-i 0) 0) 'wire-clear-erased-the-marker)
+(expect (not (storage-load)) 'nothing-loads-after-wire-clear)
+(expect (storage-save) 'save-after-wire-clear)
 
 ; Nothing is answered, and nothing is applied, while the script is booting.
 (setq boot-busy t)

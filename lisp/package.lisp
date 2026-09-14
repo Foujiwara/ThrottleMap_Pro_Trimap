@@ -308,8 +308,14 @@
 ; one into a 451-cell buffer as it arrives. 8 ms a row costs a quarter of a
 ; second for the whole map and leaves it room to keep up.
 (defun send-full-map ()
-    (looprange r 0 map-thr-n
-        (progn (send-map-row r) (sleep 0.008))))
+    (progn
+        (looprange r 0 map-thr-n
+            (progn (send-map-row r) (sleep 0.008)))
+        ; The status reply is what ends the read-back. Sending it hard on the
+        ; heels of the last row let the interface conclude the read while the
+        ; final packets were still on their way, and the top rows of the grid
+        ; arrived as zeros. Let the tail drain first.
+        (sleep 0.05)))
 
 (defun send-cfg-echo ()
     (let ((b cfg-packet))
@@ -408,6 +414,7 @@
                              (in-range (bufget-i16 data 4) 20 500)
                              (in-range (bufget-i16 data 6) 0 1000)
                              (in-range (bufget-i16 data 8) 0 10000)))
+                    ((= cmd pkt-cmd-clear) (= n 1))
                     ((= cmd pkt-set-test-thr)
                         (and (= n 3) (in-range (bufget-i16 data 1) -1000 1000)))
                     (t (and (= n 1) (>= cmd pkt-cmd-save) (<= cmd pkt-req-cfg))))))))
@@ -491,6 +498,10 @@
                 (if (= (bufget-u8 data 1) 1)
                     (if (not (lock-engage)) (exit-error 'lock-needs-standstill))
                     (progn (lock-release) (setq lock-reason 5))))
+            ((= cmd pkt-cmd-clear)
+                (if (storage-clear)
+                    (storage-reset)
+                    (exit-error 'storage-error)))
             ((= cmd pkt-cmd-save) (if (not (storage-save)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-load) (if (not (storage-load)) (exit-error 'storage-error)))
             ((= cmd pkt-cmd-reset) (storage-reset))

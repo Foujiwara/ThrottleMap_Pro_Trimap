@@ -108,6 +108,17 @@
                     (and ok (storage-write-word 127 checksum)
                          (storage-write-word 0 eeprom-magic)))))))))
 
+; Erase the stored image by clearing its marker. The body is left alone -
+; nothing reads it once the marker is gone, and rewriting 127 slots to zero
+; would cost flash wear for no gain.
+(defun storage-clear ()
+    (progn
+        (setq storage-busy t)
+        (sleep 0.01)
+        (let ((result (trap (storage-write-word 0 0))))
+            (progn (setq storage-busy nil)
+            (eq result '(exit-ok t))))))
+
 (defun storage-save ()
     (progn
         (setq storage-busy t)
