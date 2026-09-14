@@ -12,7 +12,7 @@ Map cells and throttle calibration use that same integer scale internally.
 | 01 | SET_CELL | 5: row:u8 col:u8 value:i16 - col must be inside that row own column count |
 | 02 | SET_MAP_ROW | 44: row:u8 and 21 values:i16; only that row own columns are read, the tail is padding |
 | 03 | SET_CONFIG | 44: preset:u8 torque:i16 coupling:i16 width:i16 shape:u8 hold:i16 engine_brake:i16 overrun:i16 regen_curve:u8 regenerate:u8 brake_map:u8 brake_type:u8 reserved:i16 brake_str:i16 brake_resp:i16 brake_dep:i16 brake_curve:u8 regen_brake:u8 rev_coupling:i16 rev_width:i16 rev_overrun:i16 rev_str:i16 rev_resp:i16 rev_hold:i16 rev_shape:u8 rev_curve:u8 regen_rev:u8 |
-| 04 | SET_THROTTLE | 12: source:u8 invert:u8 duty_filter:i16 slew_ms:i16 deadband:i16 filter:i16 brake_mode:u8. ADC Start/End are owned by VESC Tool, so the retired Min/Max slots now carry the control-loop damping. |
+| 04 | SET_THROTTLE | 12: source:u8 invert:u8 duty_filter:i16 reserved:i16 deadband:i16 filter:i16 brake_mode:u8. ADC Start/End are owned by VESC Tool, so the retired Min/Max slots now carry the control-loop damping. |
 | 05 | SAVE | 1 |
 | 06 | LOAD | 1 |
 | 07 | RESET | 1 |

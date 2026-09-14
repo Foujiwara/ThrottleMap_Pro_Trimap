@@ -37,7 +37,7 @@
         (bufset-u8 b 7 cfg-preset)
         ; Retired throttle Min/Max slots, now the control-loop settings.
         (bufset-i16 b 8 cfg-duty-filter)
-        (bufset-i16 b 10 cfg-slew-ms)
+        (bufset-i16 b 10 0)          ; reserved: retired output ramp
         (bufset-i16 b 12 thr-cfg-deadband)
         (bufset-i16 b 14 thr-cfg-filter)
         (bufset-i16 b 16 (to-fp cfg-torque-resp))
@@ -185,7 +185,6 @@
         (setq thr-cfg-brake-mode (bufget-u8 b 6))
         (setq cfg-preset (bufget-u8 b 7))
         (setq cfg-duty-filter (bufget-i16 b 8))
-        (setq cfg-slew-ms (bufget-i16 b 10))
         (setq thr-cfg-deadband (bufget-i16 b 12))
         (setq thr-cfg-filter (bufget-i16 b 14))
         (setq cfg-torque-resp (fp-to-f (bufget-i16 b 16)))
@@ -263,7 +262,6 @@
     (progn
         (setq thr-cfg-source (to-i (storage-buffer-i32 b 4)))
         (setq cfg-duty-filter 300)
-        (setq cfg-slew-ms 150)
         (setq thr-cfg-invert (to-i (bitwise-and (storage-buffer-i32 b 16) 1)))
         (setq thr-cfg-deadband (to-i (shr (storage-buffer-i32 b 16) 8)))
         (setq thr-cfg-filter (to-i (storage-buffer-i32 b 20)))
@@ -317,8 +315,7 @@
                                       (progn (storage-apply-image b)
                                              ; Bytes 8..11 were Min/Max there
                                              (setq cfg-duty-filter 300)
-                                             (setq cfg-slew-ms 150)
-                                             (setq thr-bidir-center 1650)
+                                                                                  (setq thr-bidir-center 1650)
                                              t)
                                       nil))
                             ((and (storage-image-valid b)
@@ -354,7 +351,6 @@
         (setq thr-cfg-source thr-src-adc)
         (setq thr-cfg-invert 0)
         (setq cfg-duty-filter 300)
-        (setq cfg-slew-ms 150)
         (setq thr-cfg-deadband 20)
         (setq thr-cfg-filter 1000)
         (setq thr-cfg-brake-mode 0)
