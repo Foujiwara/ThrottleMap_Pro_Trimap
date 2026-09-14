@@ -279,7 +279,6 @@
         (setq thr-cfg-brake-mode (to-i (storage-buffer-i32 b 504)))
         (setq cfg-brake-map 0)
         (setq cfg-brake-type 0)
-        (setq cfg-rev-erpm 500)
         (setq thr-bidir-center 1650)
         (storage-brake-defaults)
         (looprange ti 0 21
@@ -347,7 +346,6 @@
         (setq cfg-regen-curve 1)
         (setq cfg-brake-map 0)
         (setq cfg-brake-type 0)
-        (setq cfg-rev-erpm 500)
         (setq thr-bidir-center 1650)
         (storage-brake-defaults)
         (setq thr-cfg-source thr-src-adc)

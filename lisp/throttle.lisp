@@ -15,7 +15,6 @@
 (define thr-adc-cal-end 0)
 (define thr-adc-cal-loaded nil)
 (define thr-bidir-center 1650)
-(define thr-signed-sample 0)
 (define uart-buf (array-create 3))
 (define uart-started nil)
 (define uart-pos 0)
@@ -102,9 +101,11 @@
 (defun thr-read-raw ()
     (cond
         ((= thr-cfg-source thr-src-adc)
+            ; Signed on purpose: thr-read filters this value, and
+            ; thr-brake-read takes the brake side off the same filtered
+            ; result. Clipping here would leave the brake channel dead.
             (if (= thr-cfg-brake-mode thr-brake-bidir)
-                (progn (setq thr-signed-sample (thr-adc-signed))
-                       (max-f 0 thr-signed-sample))
+                (thr-adc-signed)
                 (to-fp (get-adc-decoded 0))))
         ((= thr-cfg-source thr-src-ppm) (max-f 0 (to-fp (get-ppm))))
         ((= thr-cfg-source thr-src-uart) (uart-throttle-raw))
