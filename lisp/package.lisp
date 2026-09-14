@@ -164,29 +164,36 @@
 (defun control-tick ()
     (if (or storage-busy (= pkg-enabled 0))
         ; Command nothing at all: the firmware timeout releases the motor.
-        (progn (setq live-cur-rel 0) (setq duty-filt-acc 0) (lock-release))
+        ; Nothing to clear here - the enable handler resets the lock and the
+        ; duty filter on the way in.
+        (setq live-cur-rel 0)
         (progn
             (setq live-throttle (thr-read))
             (setq live-brake (thr-brake-read))
-            (setq live-duty (duty-read))
-            (if lock-on (lock-tick)
-            (let ((lever (> live-brake 0)))
+            ; Released, the lock costs exactly this one test. Engaged, the
+            ; map is not consulted, so the duty filter does not run either.
+            (if lock-on
+                (lock-tick)
                 (progn
-                    (setq live-cur-rel
-                        (if thr-expired 0
-                            (if lever
-                                (if (= cfg-brake-map 0)
-                                    (- live-brake)
-                                    ; Positive cells in the brake rows are
-                                    ; forward torque holding a runaway
-                                    ; reverse; apply-output sorts out which
-                                    ; of those is braking and which is drive.
-                                    (map-lookup (- live-brake) live-duty))
-                                (map-lookup live-throttle live-duty))))
-                    ; Straight through, on purpose: the map is the torque
-                    ; request, and smoothing it would blunt the very thing
-                    ; the cells are there to define.
-                    (apply-output live-cur-rel)))))))
+                    (setq live-duty (duty-read))
+                    (let ((lever (> live-brake 0)))
+                        (progn
+                            (setq live-cur-rel
+                                (if thr-expired 0
+                                    (if lever
+                                        (if (= cfg-brake-map 0)
+                                            (- live-brake)
+                                            ; Positive cells in the brake rows
+                                            ; are forward torque holding a
+                                            ; runaway reverse; apply-output
+                                            ; sorts out which of those is
+                                            ; braking and which is drive.
+                                            (map-lookup (- live-brake) live-duty))
+                                        (map-lookup live-throttle live-duty))))
+                            ; Straight through, on purpose: the map is the
+                            ; torque request, and smoothing it would blunt
+                            ; the very thing the cells are there to define.
+                            (apply-output live-cur-rel))))))))
 
 (defun control-loop ()
     (loopwhile t (progn (control-tick) (sleep 0.005))))
@@ -207,7 +214,7 @@
                 (bufset-i16 b 15 (clamp-f (to-i (* (get-adc 0) 1000.0)) 0 3300))
                 (bufset-u8 b 17 pkg-enabled)
                 (bufset-u8 b 18 (if lock-on 1 0))
-                (bufset-i16 b 19 (clamp-f (lock-error) -32000 32000))
+                (bufset-i16 b 19 (if lock-on (clamp-f (lock-error) -32000 32000) 0))
                 (bufset-i16 b 21 (clamp-f (to-i (get-rpm)) -32000 32000))
                 (proto-send b)
                 (sleep 0.05))))))
@@ -391,7 +398,8 @@
                     (exit-error 'bidir-calibration-requires-bidir-adc)))
             ((= cmd pkt-set-enabled)
                 (progn (setq pkg-enabled (bufget-u8 data 1))
-                       (if (= pkg-enabled 0) (lock-release))))
+                       (setq duty-filt-acc 0)
+                       (lock-release)))
             ((= cmd pkt-set-lock)
                 (progn
                     (setq cfg-lock-poles (bufget-u8 data 1))
