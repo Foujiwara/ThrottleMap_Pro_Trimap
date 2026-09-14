@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 19
+    property int buildMarker: 20
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -2219,7 +2219,7 @@ Item {
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 2
                         RowLayout { Layout.fillWidth: true
-                            Label { text: "Tolerated travel (motor turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                            Label { text: "Spring travel (motor turns)"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
                             TextField {
                                 Layout.preferredWidth: 60
                                 horizontalAlignment: TextInput.AlignRight
