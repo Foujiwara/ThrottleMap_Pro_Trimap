@@ -29,11 +29,16 @@
 (define cfg-brake-resp 1.0)
 (define cfg-brake-dep 0.0)
 (define cfg-brake-curve 0)
-; Reverse shaping - generator parameters now, the reverse behaviour lives
-; in the brake rows' negative-duty columns.
+; Reverse generator - the traction law's eight settings, mirrored onto the
+; brake rows' negative-duty columns.
+(define cfg-rev-str 1.0)
+(define cfg-rev-resp 1.0)
+(define cfg-rev-hold 0.0)
 (define cfg-rev-coupling 1.0)
 (define cfg-rev-width 0.10)
+(define cfg-rev-shape 1)
 (define cfg-rev-overrun 0.12)
+(define cfg-rev-curve 1)
 (define live-throttle 0)
 (define live-duty 0)
 (define live-cur-rel 0)
@@ -42,7 +47,7 @@
 (define brake-stopped nil)
 ; One buffer per owner: telemetry never shares its buffer with the event task.
 (define row-packet (array-create 44))
-(define cfg-packet (array-create 44))
+(define cfg-packet (array-create 52))
 
 @const-start
 ; Lever braking only. Engine braking and overrun regen always stay pure
@@ -162,6 +167,11 @@
         (bufset-i16 b 38 (fx-enc cfg-rev-coupling))
         (bufset-i16 b 40 (fx-enc cfg-rev-width))
         (bufset-i16 b 42 (fx-enc cfg-rev-overrun))
+        (bufset-i16 b 44 (fx-enc cfg-rev-str))
+        (bufset-i16 b 46 (fx-enc cfg-rev-resp))
+        (bufset-i16 b 48 (fx-enc cfg-rev-hold))
+        (bufset-u8 b 50 cfg-rev-shape)
+        (bufset-u8 b 51 cfg-rev-curve)
         (proto-send b))))
 
 (defun packet-valid (data)
@@ -181,7 +191,7 @@
                                         (setq ok nil)))
                                 ok))))
                     ((= cmd pkt-set-config)
-                        (and (= n 35) (<= (bufget-u8 data 1) 4)
+                        (and (= n 44) (<= (bufget-u8 data 1) 4)
                              (in-range (bufget-i16 data 2) 300 2000)
                              (in-range (bufget-i16 data 4) 0 1500)
                              (in-range (bufget-i16 data 6) 20 300)
@@ -201,7 +211,13 @@
                              (<= (bufget-u8 data 28) 1)
                              (in-range (bufget-i16 data 29) 0 1500)
                              (in-range (bufget-i16 data 31) 20 300)
-                             (in-range (bufget-i16 data 33) 0 500)))
+                             (in-range (bufget-i16 data 33) 0 500)
+                             (in-range (bufget-i16 data 35) 0 1000)
+                             (in-range (bufget-i16 data 37) 300 2000)
+                             (in-range (bufget-i16 data 39) 0 1000)
+                             (<= (bufget-u8 data 41) 3)
+                             (<= (bufget-u8 data 42) 3)
+                             (<= (bufget-u8 data 43) 1)))
                     ((= cmd pkt-set-thr)
                         (and (= n 12) (<= (bufget-u8 data 1) 3)
                              (<= (bufget-u8 data 2) 1)
@@ -244,15 +260,18 @@
                     (setq cfg-rev-coupling (fx-dec (bufget-i16 data 29)))
                     (setq cfg-rev-width (fx-dec (bufget-i16 data 31)))
                     (setq cfg-rev-overrun (fx-dec (bufget-i16 data 33)))
+                    (setq cfg-rev-str (fx-dec (bufget-i16 data 35)))
+                    (setq cfg-rev-resp (fx-dec (bufget-i16 data 37)))
+                    (setq cfg-rev-hold (fx-dec (bufget-i16 data 39)))
+                    (setq cfg-rev-shape (bufget-u8 data 41))
+                    (setq cfg-rev-curve (bufget-u8 data 42))
                     ; Each half regenerates on its own flag: a traction
                     ; slider never rewrites brake rows, and vice versa.
                     (if (= (bufget-u8 data 16) 1)
                         (gen-thermal-map cfg-torque-resp cfg-speed-coupling cfg-trans-width
                             cfg-trans-shape cfg-high-hold cfg-engine-brake cfg-overrun-regen cfg-regen-curve))
-                    (if (= (bufget-u8 data 28) 1)
-                        (gen-brake-map cfg-brake-str cfg-brake-resp cfg-brake-dep
-                            cfg-brake-curve cfg-rev-coupling cfg-rev-width
-                            cfg-rev-overrun))))
+                    (if (= (bufget-u8 data 28) 1) (gen-brake-half))
+                    (if (= (bufget-u8 data 43) 1) (gen-rev-half))))
             ((= cmd pkt-set-thr)
                 (progn
                     (setq thr-cfg-source (bufget-u8 data 1))

@@ -1,22 +1,23 @@
 # CarMap Beta (Brake Map)
 
-**Beta fork of CarMap Thermal Throttle.** A configurable 441-cell
+**Beta fork of CarMap Thermal Throttle.** A configurable 451-cell
 throttle/duty map drives relative propulsion current and relative brake
 current. Native VESC current, voltage, temperature and speed limits
 remain active.
 
 The grid is **ragged**, on purpose:
 
-- **Traction rows**: throttle 0..100% in 5% steps (the same resolution as
-  the stable package), duty 0..100%.
+- **Throttle rows**: 5..100% in 5% steps (the same resolution as the
+  stable package), duty 0..100%.
 - **Brake rows**: lever 0..-100% in 10% steps, duty **-100%..+100%**. The
-  right half is braking against speed, the left half is reverse.
+  right half is braking against speed, the left half is reverse. The 0%
+  row belongs here, so engine braking while rolling backwards is editable
+  on its own.
 
 Negative duty under a positive throttle is not stored: for traction, duty
-is simply speed, so that side is the positive side **mirrored**. Rolling
-backwards reads the same curve as rolling forwards at the same speed, and
-engine braking works in both directions. The space saved is what pays for
-the traction half keeping its 5% steps.
+is simply speed, so that side is the positive side **mirrored** - drawn
+dimmed in the graph, and editing either side edits the same cell. The
+space saved is what pays for the throttle rows keeping their 5% steps.
 
 Each half has its own generator and its own regenerate flag, so shaping
 one never discards hand edits made to the other. The brake generator

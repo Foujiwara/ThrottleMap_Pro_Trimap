@@ -29,7 +29,7 @@ Item {
     anchors.fill: parent
     // Bumped on every edit - shown in the header as "build N" so a
     // stale/cached install is obvious at a glance instead of ambiguous.
-    property int buildMarker: 8
+    property int buildMarker: 10
     // Desktop and phone hosts need genuinely different sizing rules, not
     // one compromise value - a cap small enough to avoid overflowing a
     // phone screen leaves desktop far too small, and anything generous
@@ -66,7 +66,7 @@ Item {
     readonly property int mapThrN: 31
     readonly property int mapDutyN: 21   // brake rows; traction rows store 11
     readonly property int mapThrZero: 10
-    readonly property int mapCells: 441
+    readonly property int mapCells: 451
 
     // Signed throttle a row stands for, and its label.
     function rowThrottle(t) {
@@ -77,16 +77,18 @@ Item {
     // no extra information, so the negative side is the positive side
     // mirrored and is not stored. The space pays for the traction half's
     // 5% throttle steps instead.
-    function mapRowCols(t) { return t < mapThrZero ? 21 : 11 }
+    function mapRowCols(t) { return t <= mapThrZero ? 21 : 11 }
     // Every view draws 21 display columns per row, duty -100%..+100%.
     // dispCol says which stored cell one of them reads.
-    function dispCol(t, g) { return t < mapThrZero ? g : Math.abs(g - 10) }
+    function dispCol(t, g) { return t <= mapThrZero ? g : Math.abs(g - 10) }
+    // True where a display column is only a mirror of another cell.
+    function isMirrored(t, g) { return t > mapThrZero && g < 10 }
     function dispDuty(g) { return (g - 10) / 10.0 }
     // Signed duty a STORED column stands for
-    function colDuty(t, d) { return t < mapThrZero ? (d - 10) / 10.0 : d / 10.0 }
+    function colDuty(t, d) { return t <= mapThrZero ? (d - 10) / 10.0 : d / 10.0 }
     function dutyPct(t, d) {
         var v = Math.round(colDuty(t, d) * 100)
-        return t < mapThrZero ? v + "%" : (v === 0 ? "0%" : "±" + v + "%")
+        return t <= mapThrZero ? v + "%" : (v === 0 ? "0%" : "±" + v + "%")
     }
     // Nearest stored column of a row to a signed duty
     function colOf(t, duty) {
@@ -148,9 +150,14 @@ Item {
     property real cfgBrakeDep: 0.0
     property int cfgBrakeCurve: 0
     // Reverse shaping: generator parameters for the brake rows' left half
+    property real cfgRevStr: 1.0
+    property real cfgRevResp: 1.0
+    property real cfgRevHold: 0.0
     property real cfgRevCoupling: 1.0
     property real cfgRevWidth: 0.10
+    property int cfgRevShape: 1
     property real cfgRevOverrun: 0.12
+    property int cfgRevCurve: 1
 
     property int thrSource: 0 // 0 ADC, 1 PPM, 2 UART
     property int thrInvert: 0
@@ -185,6 +192,11 @@ Item {
             if (c.revCoupling !== undefined) range(c.revCoupling,0,1.5,false)
             if (c.revWidth !== undefined) range(c.revWidth,0.02,0.3,false)
             if (c.revOverrun !== undefined) range(c.revOverrun,0,0.5,false)
+            if (c.revStr !== undefined) range(c.revStr,0,1,false)
+            if (c.revResp !== undefined) range(c.revResp,0.3,2,false)
+            if (c.revHold !== undefined) range(c.revHold,0,1,false)
+            if (c.revShape !== undefined) range(c.revShape,0,3,true)
+            if (c.revCurve !== undefined) range(c.revCurve,0,3,true)
             if (c.brakeCurve !== undefined) range(c.brakeCurve,0,3,true)
         }
     }
@@ -208,7 +220,7 @@ Item {
         return (x < 0 ? Math.ceil(x) : Math.floor(x)) / 100
     }
     function cellIdx(t, d) {
-        return t < mapThrZero ? t * 21 + d : 210 + (t - mapThrZero) * 11 + d
+        return t <= mapThrZero ? t * 21 + d : 231 + (t - mapThrZero - 1) * 11 + d
     }
     function getCell(t, d) { return mapData[cellIdx(t, d)] }
     function setCellLocal(t, d, v) {
@@ -252,7 +264,7 @@ Item {
     // Two independent regenerate flags: a traction slider must not
     // rewrite the brake rows, and a brake slider must not rewrite the
     // traction ones.
-    function sendSetConfig(regenerate, regenBrake) {
+    function sendSetConfig(regenerate, regenBrake, regenRev) {
         var b = [cmdSetConfig, cfgPreset & 0xff]
         b = b.concat(i16Bytes(fxEnc(cfgTorqueResp)))
         b = b.concat(i16Bytes(fxEnc(cfgSpeedCoupling)))
@@ -274,6 +286,12 @@ Item {
         b = b.concat(i16Bytes(fxEnc(cfgRevCoupling)))
         b = b.concat(i16Bytes(fxEnc(cfgRevWidth)))
         b = b.concat(i16Bytes(fxEnc(cfgRevOverrun)))
+        b = b.concat(i16Bytes(fxEnc(cfgRevStr)))
+        b = b.concat(i16Bytes(fxEnc(cfgRevResp)))
+        b = b.concat(i16Bytes(fxEnc(cfgRevHold)))
+        b.push(cfgRevShape & 0xff)
+        b.push(cfgRevCurve & 0xff)
+        b.push(regenRev === true ? 1 : 0)
         sendPacket(b)
     }
     function sendSetThrottle() {
@@ -291,6 +309,7 @@ Item {
         if (!mapReceived || !cfgReceived) { lastCmdStatus = "Read map and settings before saving"; return }
         if (regenDebounce.running) { regenDebounce.stop(); regenerateLocalMap() }
         if (brakeRegenDebounce.running) { brakeRegenDebounce.stop(); regenerateLocalBrake() }
+        if (revRegenDebounce.running) { revRegenDebounce.stop(); regenerateLocalRev() }
         lastCmdStatus = "Uploading and saving…"
         sendSetConfig(false); sendSetThrottle(); sendAllRows(); sendPacket([cmdSave])
     }
@@ -408,7 +427,7 @@ Item {
             pendingPacket = null
             pumpTx()
         } else if (cmd === rxCfgEcho) {
-            if (view.byteLength !== 44) return
+            if (view.byteLength !== 52) return
             cfgReceived = true
             cfgPreset = view.getUint8(1)
             cfgTorqueResp = fxDec(view.getInt16(2, false))
@@ -436,6 +455,11 @@ Item {
             cfgRevCoupling = fxDec(view.getInt16(38, false))
             cfgRevWidth = fxDec(view.getInt16(40, false))
             cfgRevOverrun = fxDec(view.getInt16(42, false))
+            cfgRevStr = fxDec(view.getInt16(44, false))
+            cfgRevResp = fxDec(view.getInt16(46, false))
+            cfgRevHold = fxDec(view.getInt16(48, false))
+            cfgRevShape = view.getUint8(50)
+            cfgRevCurve = view.getUint8(51)
         }
     }
 
@@ -509,8 +533,37 @@ Item {
     // the user stops moving the slider, not on every pixel of the drag.
     property Timer regenDebounce: Timer { interval: 60; onTriggered: regenerateLocalMap() }
     function requestRegen() { regenDebounce.restart() }
-    property Timer brakeRegenDebounce: Timer { interval: 60; onTriggered: { regenerateLocalBrake(); sendSetConfig(false, true) } }
+    property Timer brakeRegenDebounce: Timer { interval: 60; onTriggered: { regenerateLocalBrake(); sendSetConfig(false, true, false) } }
     function requestBrakeRegen() { brakeRegenDebounce.restart() }
+    property Timer revRegenDebounce: Timer { interval: 60; onTriggered: { regenerateLocalRev(); sendSetConfig(false, false, true) } }
+    function requestRevRegen() { revRegenDebounce.restart() }
+
+    // QML mirror of gen-rev-half: the traction law negated, over reverse
+    // duty, with its own eight settings.
+    function regenerateLocalRev() {
+        var arr = mapData.slice()
+        for (var bi = 0; bi < mapThrZero; bi++) {
+            var lever = (mapThrZero - bi) / 10.0
+            var peak = cfgRevStr * thermalPeak(lever, cfgRevResp, cfgRevHold)
+            var balance = Math.max(0, Math.min(1, lever * cfgRevCoupling))
+            var start = Math.max(0, Math.min(1, balance - cfgRevWidth))
+            for (var di = 0; di < 11; di++) {
+                var rev = (10 - di) / 10.0
+                var val
+                if (cfgRevCoupling === 0) val = -peak
+                else if (rev <= start) val = -peak
+                else if (rev <= balance) {
+                    var pr = (rev - start) / Math.max(0.001, balance - start)
+                    val = -peak * (1 - shapeCurve(pr, cfgRevShape))
+                } else {
+                    var over = (rev - balance) / Math.max(0.001, 1 - balance)
+                    val = cfgRevOverrun * Math.pow(Math.max(0, Math.min(1, over)), 1 + cfgRevCurve)
+                }
+                arr[cellIdx(bi, di)] = quantizeCell(val)
+            }
+        }
+        mapData = arr
+    }
 
     // QML mirror of gen-brake-map: braking demand against forward speed.
     function regenerateLocalBrake() {
@@ -518,28 +571,10 @@ Item {
         for (var bi = 0; bi < mapThrZero; bi++) {
             var lever = (mapThrZero - bi) / 10.0
             var peak = cfgBrakeStr * Math.pow(lever, cfgBrakeResp)
-            var balance = Math.max(0, Math.min(1, lever * cfgRevCoupling))
-            var start = Math.max(0, Math.min(1, balance - cfgRevWidth))
-            for (var di = 0; di < 21; di++) {
+            for (var di = 11; di < 21; di++) {
                 var duty = (di - 10) / 10.0
-                var val
-                if (duty > 0) {
-                    var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
-                    val = -peak * Math.max(0, Math.min(1, speed))
-                } else if (cfgRevCoupling === 0) {
-                    val = -peak
-                } else {
-                    var rev = -duty
-                    if (rev <= start) val = -peak
-                    else if (rev <= balance) {
-                        var pr = (rev - start) / Math.max(0.001, balance - start)
-                        val = -peak * (1 - shapeCurve(pr, 1))
-                    } else {
-                        var over = (rev - balance) / Math.max(0.001, 1 - balance)
-                        val = cfgRevOverrun * Math.pow(Math.max(0, Math.min(1, over)), 2)
-                    }
-                }
-                arr[cellIdx(bi, di)] = quantizeCell(val)
+                var speed = (1 - cfgBrakeDep) + cfgBrakeDep * Math.pow(duty, 1 + cfgBrakeCurve)
+                arr[cellIdx(bi, di)] = quantizeCell(-peak * Math.max(0, Math.min(1, speed)))
             }
         }
         mapData = arr
@@ -549,6 +584,13 @@ Item {
     // slider ever rewrites them (gen-thermal-map in map.lisp matches).
     function regenerateLocalMap() {
         var arr = mapData.slice()
+        // Released row, negative duty: engine braking while rolling
+        // backwards, seeded as the mirror and editable on its own.
+        for (var mi = 0; mi < 10; mi++) {
+            var mduty = (10 - mi) / 10.0
+            arr[cellIdx(mapThrZero, mi)] =
+                quantizeCell(-cfgEngineBrake * Math.pow(mduty, 1 + cfgRegenCurve))
+        }
         for (var ti = 0; ti < 21; ti++) {
             var thr = ti / 20.0
             var peak = thermalPeak(thr, cfgTorqueResp, cfgHighHold)
@@ -571,7 +613,7 @@ Item {
                         val = -cfgOverrunRegen * Math.pow(Math.max(0,Math.min(1,over)), 1 + cfgRegenCurve)
                     }
                 }
-                arr[cellIdx(ti + mapThrZero, di)] = quantizeCell(val)
+                arr[cellIdx(ti + mapThrZero, ti === 0 ? di + 10 : di)] = quantizeCell(val)
             }
         }
         mapData = arr
@@ -779,17 +821,25 @@ Item {
                                         var d = dispCol(t, g)
                                         var v = getCell(t, d)
                                         var col = valueColor(v)
+                                        var mirrored = isMirrored(t, g)
                                         ctx.fillStyle = Qt.rgba(col.r, col.g, col.b, 1)
                                         var y = height - (t - rowBase + 1) * ch
                                         var x = (g / 20) * width - cw / 2
                                         var selected = isSelected(t, d)
                                         ctx.fillRect(x, y, cw - 1, ch - 1)
+                                        // Dim what is only a mirror of the
+                                        // other side, so the editable cells
+                                        // are obvious at a glance.
+                                        if (mirrored) {
+                                            ctx.fillStyle = "rgba(14,16,19,0.55)"
+                                            ctx.fillRect(x, y, cw - 1, ch - 1)
+                                        }
                                         if (selected) {
                                             ctx.strokeStyle = "#ffffff"
                                             ctx.lineWidth = 2
                                             ctx.strokeRect(x+1, y+1, cw - 3, ch - 3)
                                         }
-                                        if (cw > 30) {
+                                        if (cw > 30 && !mirrored) {
                                             ctx.fillStyle = Math.abs(v) > 0.5 ? "#111" : "#eee"
                                             ctx.font = Math.max(10, Math.min(15, cw * 0.32)) + "px sans-serif"
                                             ctx.textAlign = "center"
@@ -872,7 +922,7 @@ Item {
                     // axis labels
                     Label { text: cfgBrakeMap === 1 ? "Brake -100%  /  Duty -100%" : "Throttle 0%  /  Duty -100%"; color: "#888"; anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 4 }
                     Label {
-                        text: "Traction rows are mirrored about duty 0 - the two halves are the same cells"
+                        text: "Dimmed = mirror of the other side, same cells. The released row (0% throttle) has its own editable reverse half."
                         color: "#555"; font.pixelSize: 15
                         anchors.horizontalCenter: parent.horizontalCenter; anchors.top: parent.top; anchors.margins: 4
                     }
@@ -921,7 +971,7 @@ Item {
                     // Moved here from the Configurator tab: preset + the 8
                     // map-shaping sliders, right next to the heatmap so
                     // dragging them shows their effect immediately.
-                    Label { text: "Preset & map shape"; font.bold: true; color: "#ddd" }
+                    Label { text: "1 - Traction  (top half)"; font.bold: true; color: "#ddd" }
                     Flow {
                         Layout.fillWidth: true
                         spacing: 6
@@ -1093,9 +1143,10 @@ Item {
                         Layout.fillWidth: true
                         spacing: 10
 
-                        Label { text: "Brake curve (negative rows)"; font.bold: true; color: "#ddd" }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
+                        Label { text: "2 - Brake  (bottom right: braking against speed)"; font.bold: true; color: "#ddd" }
                         Label {
-                            text: "The right half of these rows is braking against forward speed - flat by default, so -10% lever is -10% current at any speed. The left half is reverse, below."
+                            text: "A flat plateau by default: -10% lever is -10% current at any speed. Only the shape settings here, since braking rarely needs a balance point - reverse, below, gets the full set."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         Flow {
@@ -1103,16 +1154,14 @@ Item {
                             spacing: 6
                             Button {
                                 text: "Regenerate brake"
-                                onClicked: { brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true) }
+                                onClicked: { brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true, false) }
                             }
                             Button {
-                                text: "Default brake curve"
+                                text: "Default brake"
                                 onClicked: {
                                     cfgBrakeStr = 1.0; cfgBrakeResp = 1.0
                                     cfgBrakeDep = 0.0; cfgBrakeCurve = 0
-                                    cfgRevCoupling = 1.0; cfgRevWidth = 0.10
-                                    cfgRevOverrun = 0.12
-                                    brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true)
+                                    brakeRegenDebounce.stop(); regenerateLocalBrake(); sendSetConfig(false, true, false)
                                 }
                             }
                         }
@@ -1176,19 +1225,105 @@ Item {
                             text: "0.00 (default) brakes the same at every speed. Raise it to fade braking out towards a standstill, which keeps regen from grabbing at walking pace."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
-                        // Left half of the brake rows: the reverse region.
                         ColumnLayout {
-                            visible: true
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Speed curve"; color: "#ccc" }
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: ["Linear", "Squared", "Cubed", "Fourth power"]
+                                currentIndex: cfgBrakeCurve
+                                onActivated: (idx) => { cfgBrakeCurve = idx; requestBrakeRegen() }
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        visible: cfgBrakeMap === 1
                         Layout.fillWidth: true
                         spacing: 10
 
                         Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
-                        Label { text: "Reverse (left half of the brake rows)"; font.bold: true; color: "#ddd" }
+                        Label { text: "3 - Reverse  (bottom left: negative duty)"; font.bold: true; color: "#ddd" }
                         Label {
-                            text: "Only a bidirectional brake ever reaches these columns - the other two types never travel backwards under power, so shaping reverse costs them nothing."
+                            text: "The traction law again, mirrored: the lever is the throttle, reverse duty is the speed, and each lever position settles at its own reverse speed instead of accelerating backwards indefinitely. Only a bidirectional brake ever reaches these columns."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
-
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            Button {
+                                text: "Regenerate reverse"
+                                onClicked: { revRegenDebounce.stop(); regenerateLocalRev(); sendSetConfig(false, false, true) }
+                            }
+                            Button {
+                                text: "Default reverse"
+                                onClicked: {
+                                    cfgRevStr = 1.0; cfgRevResp = 1.0; cfgRevHold = 0.0
+                                    cfgRevCoupling = 1.0; cfgRevWidth = 0.10; cfgRevShape = 1
+                                    cfgRevOverrun = 0.12; cfgRevCurve = 1
+                                    revRegenDebounce.stop(); regenerateLocalRev(); sendSetConfig(false, false, true)
+                                }
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Reverse torque at full lever"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgRevStr.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.0)
+                                        if (v !== null) { cfgRevStr = v; requestRevRegen() }
+                                        text = Qt.binding(function() { return cfgRevStr.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgRevStr; onMoved: { cfgRevStr = value; requestRevRegen() } }
+                        }
+                        Label {
+                            text: "Caps reverse torque below the VESC own current limit. Lower it to make reverse deliberately gentler than braking."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "Lever response"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgRevResp.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.3, 2.0)
+                                        if (v !== null) { cfgRevResp = v; requestRevRegen() }
+                                        text = Qt.binding(function() { return cfgRevResp.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.3; to: 2.0; value: cfgRevResp; onMoved: { cfgRevResp = value; requestRevRegen() } }
+                        }
+                        Label {
+                            text: "Below 1.00 the first part of the lever travel pulls harder; above 1.00 it stays soft and firms up at the end."
+                            color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            RowLayout { Layout.fillWidth: true
+                                Label { text: "High lever hold"; color: "#ccc"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                TextField {
+                                    Layout.preferredWidth: 60
+                                    horizontalAlignment: TextInput.AlignRight
+                                    text: cfgRevHold.toFixed(2)
+                                    onEditingFinished: {
+                                        var v = parseClamped(text, 0.0, 1.0)
+                                        if (v !== null) { cfgRevHold = v; requestRevRegen() }
+                                        text = Qt.binding(function() { return cfgRevHold.toFixed(2) })
+                                    }
+                                }
+                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.0; value: cfgRevHold; onMoved: { cfgRevHold = value; requestRevRegen() } }
+                        }
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 2
                             RowLayout { Layout.fillWidth: true
@@ -1199,20 +1334,15 @@ Item {
                                     text: cfgRevCoupling.toFixed(2)
                                     onEditingFinished: {
                                         var v = parseClamped(text, 0.0, 1.5)
-                                        if (v !== null) { cfgRevCoupling = v; requestBrakeRegen() }
+                                        if (v !== null) { cfgRevCoupling = v; requestRevRegen() }
                                         text = Qt.binding(function() { return cfgRevCoupling.toFixed(2) })
                                     }
                                 }
                             }
-                            Slider {
-                                Layout.fillWidth: true; from: 0.0; to: 1.5
-                                value: cfgRevCoupling
-                                onMoved: cfgRevCoupling = value
-                                onPressedChanged: if (!pressed) requestBrakeRegen()
-                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 1.5; value: cfgRevCoupling; onMoved: { cfgRevCoupling = value; requestRevRegen() } }
                         }
                         Label {
-                            text: "The reverse duty each lever position settles at: 1.00 means 10% lever backs up to 10% duty and then stops pulling. Lower is shorter-geared in reverse; 0.00 removes the limit and it keeps accelerating backwards."
+                            text: "The reverse duty each lever position settles at: 1.00 means 30% lever backs up to 30% duty and then stops pulling. 0.00 removes the balance and it keeps accelerating backwards."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
                         }
                         ColumnLayout {
@@ -1225,16 +1355,21 @@ Item {
                                     text: cfgRevWidth.toFixed(2)
                                     onEditingFinished: {
                                         var v = parseClamped(text, 0.02, 0.30)
-                                        if (v !== null) { cfgRevWidth = v; requestBrakeRegen() }
+                                        if (v !== null) { cfgRevWidth = v; requestRevRegen() }
                                         text = Qt.binding(function() { return cfgRevWidth.toFixed(2) })
                                     }
                                 }
                             }
-                            Slider {
-                                Layout.fillWidth: true; from: 0.02; to: 0.30
-                                value: cfgRevWidth
-                                onMoved: cfgRevWidth = value
-                                onPressedChanged: if (!pressed) requestBrakeRegen()
+                            Slider { Layout.fillWidth: true; from: 0.02; to: 0.30; value: cfgRevWidth; onMoved: { cfgRevWidth = value; requestRevRegen() } }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Transition shape"; color: "#ccc" }
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: ["Linear", "Squared", "Late", "Fourth power"]
+                                currentIndex: cfgRevShape
+                                onActivated: (idx) => { cfgRevShape = idx; requestRevRegen() }
                             }
                         }
                         ColumnLayout {
@@ -1247,35 +1382,29 @@ Item {
                                     text: cfgRevOverrun.toFixed(2)
                                     onEditingFinished: {
                                         var v = parseClamped(text, 0.0, 0.50)
-                                        if (v !== null) { cfgRevOverrun = v; requestBrakeRegen() }
+                                        if (v !== null) { cfgRevOverrun = v; requestRevRegen() }
                                         text = Qt.binding(function() { return cfgRevOverrun.toFixed(2) })
                                     }
                                 }
                             }
-                            Slider {
-                                Layout.fillWidth: true; from: 0.0; to: 0.50
-                                value: cfgRevOverrun
-                                onMoved: cfgRevOverrun = value
-                                onPressedChanged: if (!pressed) requestBrakeRegen()
-                            }
+                            Slider { Layout.fillWidth: true; from: 0.0; to: 0.50; value: cfgRevOverrun; onMoved: { cfgRevOverrun = value; requestRevRegen() } }
                         }
                         Label {
-                            text: "Forward torque applied past the balance point, to pull a reverse that is running away downhill back down to it."
+                            text: "Forward torque past the balance point, to pull a reverse that is running away downhill back down to it."
                             color: "#777"; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.pixelSize: 16
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { text: "Runaway curve"; color: "#ccc" }
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: ["Linear", "Progressive", "Late", "Fourth power"]
+                                currentIndex: cfgRevCurve
+                                onActivated: (idx) => { cfgRevCurve = idx; requestRevRegen() }
+                            }
                         }
                     }
 
-                        ColumnLayout {
-                            Layout.fillWidth: true; spacing: 2
-                            Label { text: "Speed curve"; color: "#ccc" }
-                            ComboBox {
-                                Layout.fillWidth: true
-                                model: ["Linear", "Squared", "Cubed", "Fourth power"]
-                                currentIndex: cfgBrakeCurve
-                                onActivated: (idx) => { cfgBrakeCurve = idx; requestBrakeRegen() }
-                            }
-                        }
-                    }
 
                     Rectangle { Layout.fillWidth: true; height: 1; color: "#333" }
 
@@ -1398,8 +1527,8 @@ Item {
             function mapRowSlice(t) { var r = []; for (var d = 0; d < mapRowCols(t); d++) r.push(getCell(t,d)); return r }
             // Only meaningful within one half; the two do not share columns.
             function mapColSlice(d) {
-                var r = [], t0 = curRow < mapThrZero ? 0 : mapThrZero
-                var t1 = curRow < mapThrZero ? mapThrZero : mapThrN
+                var r = [], t0 = curRow <= mapThrZero ? 0 : mapThrZero + 1
+                var t1 = curRow <= mapThrZero ? mapThrZero + 1 : mapThrN
                 for (var t = t0; t < t1; t++) r.push(getCell(t, Math.min(d, mapRowCols(t)-1)))
                 return r
             }
@@ -1442,8 +1571,8 @@ Item {
                 cfgPreset = 0
                 if (!clipboardCol) return
                 var arr = mapData.slice()
-                var t0 = curRow < mapThrZero ? 0 : mapThrZero
-                var t1 = curRow < mapThrZero ? mapThrZero : mapThrN
+                var t0 = curRow <= mapThrZero ? 0 : mapThrZero + 1
+                var t1 = curRow <= mapThrZero ? mapThrZero + 1 : mapThrN
                 for (var t = t0; t < t1 && t - t0 < clipboardCol.length; t++)
                     if (d < mapRowCols(t)) arr[cellIdx(t, d)] = Math.max(-1, Math.min(1, clipboardCol[t - t0]))
                 mapData = arr
@@ -2075,7 +2204,9 @@ Item {
                             brakeStr: cfgBrakeStr, brakeResp: cfgBrakeResp,
                             brakeDep: cfgBrakeDep, brakeCurve: cfgBrakeCurve,
                             revCoupling: cfgRevCoupling, revWidth: cfgRevWidth,
-                            revOverrun: cfgRevOverrun } }) }
+                            revOverrun: cfgRevOverrun, revStr: cfgRevStr,
+                            revResp: cfgRevResp, revHold: cfgRevHold,
+                            revShape: cfgRevShape, revCurve: cfgRevCurve } }) }
                         Button {
                             text: "Import from text"
                             onClicked: {
@@ -2101,6 +2232,11 @@ Item {
                                         cfgRevCoupling = obj.cfg.revCoupling === undefined ? 1.0 : obj.cfg.revCoupling
                                         cfgRevWidth = obj.cfg.revWidth === undefined ? 0.10 : obj.cfg.revWidth
                                         cfgRevOverrun = obj.cfg.revOverrun === undefined ? 0.12 : obj.cfg.revOverrun
+                                        cfgRevStr = obj.cfg.revStr === undefined ? 1.0 : obj.cfg.revStr
+                                        cfgRevResp = obj.cfg.revResp === undefined ? 1.0 : obj.cfg.revResp
+                                        cfgRevHold = obj.cfg.revHold === undefined ? 0.0 : obj.cfg.revHold
+                                        cfgRevShape = obj.cfg.revShape === undefined ? 1 : obj.cfg.revShape
+                                        cfgRevCurve = obj.cfg.revCurve === undefined ? 1 : obj.cfg.revCurve
                                         cfgBrakeCurve = obj.cfg.brakeCurve === undefined ? 0 : obj.cfg.brakeCurve
                                     }
                                     regenDebounce.stop(); sendSetConfig(false); sendSetThrottle(); sendAllRows(); requestMap()
