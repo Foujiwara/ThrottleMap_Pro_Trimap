@@ -78,6 +78,13 @@
 (define live-duty 0)
 (define live-cur-rel 0)
 (define live-brake 0)
+; Time of the last packet from the interface. send-data goes to the last port
+; that received a packet and keeps going there after the app has gone: 20
+; LIVE packets a second into a BLE UART module that has nobody to forward
+; them to hang the module until the controller reboots. LIVE is therefore
+; only sent while the interface is there (keep-alive every 500 ms).
+(define ui-seen nil)
+(define ui-rx-time 0)
 ; Direction latch for the no-reverse brake type. A bare (> rpm 0) test
 ; oscillates: the negative current it gates is exactly what drives the rpm
 ; through zero, so the decision flips every tick. Two thresholds instead of
@@ -270,6 +277,9 @@
 (defun control-loop ()
     (loopwhile t (progn (control-tick) (sleep 0.005))))
 
+(defun ui-listening ()
+    (and ui-seen (< (secs-since ui-rx-time) 3.0)))
+
 (defun telemetry-loop ()
     (let ((b (array-create 23)))
         (progn (bufset-u8 b 0 pkt-live)
@@ -292,7 +302,7 @@
                                    (if boot-busy 128 0)))
                 (bufset-i16 b 19 (if lock-on (clamp-f (lock-error) -32000 32000) 0))
                 (bufset-i16 b 21 (clamp-f (to-i (get-rpm)) -32000 32000))
-                (proto-send b)
+                (if (ui-listening) (proto-send b))
                 (sleep 0.05))))))
 
 (defun send-map-row (row-i)
@@ -531,10 +541,18 @@
                     cmd)))))
         (proto-send-status 6 (if (> (buflen data) 0) (bufget-u8 data 0) 0)))))
 
+(defun handle-rx (data)
+    (progn
+        (setq ui-rx-time (systime))
+        (setq ui-seen t)
+        ; Keep-alive: presence only, no status reply.
+        (if (not (and (= (buflen data) 1) (= (bufget-u8 data 0) pkt-keepalive)))
+            (handle-packet data))))
+
 (defun event-handler ()
     (loopwhile t
         (recv
-            ((event-data-rx . (? data)) (handle-packet data))
+            ((event-data-rx . (? data)) (handle-rx data))
             (_ nil))))
 @const-end
 

@@ -20,6 +20,7 @@ Map cells and throttle calibration use that same integer scale internally.
 | 09 | REQUEST_CFG | 1 |
 | 0A | SET_TEST_THROTTLE | 3: value:i16, -1000..1000 (negative is a brake request) |
 | 0B | CALIBRATE_BIDIR | 1: captures the bidirectional neutral voltage |
+| 10 | KEEPALIVE | 1: sent by the interface every 500 ms while it is open; no reply |
 | 0C | SET_ENABLED | 2: enabled:u8 - 0 stops every motor command |
 | 0D | SET_LOCK | 8: pole_pairs:u8 travel_mrev:i16 max_current:i16 damping:i16 |
 | 0E | LOCK_CMD | 2: engage:u8 - refused unless stopped and idle |
@@ -70,3 +71,9 @@ SAVE cannot run after a failed row/config upload. Timeout is not success;
 read back before retrying. Test commands bypass this queue, are refreshed
 every 100 ms while active, and expire on the controller after 500 ms.
 LIVE runs at 20 Hz, and its values never replace the last command result.
+
+LIVE is only sent while the interface is present: any packet received in the
+last 3 seconds (the KEEPALIVE every 500 ms in practice). send-data goes to the
+last port that received a packet and stays there after the app has gone; a
+permanent 20 Hz stream into a BLE UART module with nobody connected hangs the
+module until the controller reboots, for VESC Tool and any other app.
